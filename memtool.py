@@ -402,6 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     # template 子命令
     s = sub.add_parser("template", help="使用模板快速记录信息（template list 查看可用模板）")
     s.add_argument("template_name", help="模板名称（如 error_analysis, design_decision）或 'list' 查看所有模板")
+    s.add_argument("--format", default="json", choices=["json","text"], help="输出格式，默认 json 便于 agent 解析")
     s.add_argument("--task-id", help="可选：关联的 task_id")
     s.add_argument("--step-id", help="可选：关联的 step_id")
     s.add_argument("--tag", action="append", help="可重复标签")
