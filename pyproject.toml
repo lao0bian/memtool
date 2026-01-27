@@ -1,0 +1,31 @@
+[project]
+name = "memtool"
+version = "0.1.0"
+description = "SQLite-based memory tool (MVP) for agent workflows"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "mcp[cli]",
+  "jieba>=0.42",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+web = [
+  "fastapi",
+  "uvicorn[standard]",
+  "jinja2",
+  "python-multipart",
+]
+
+[project.scripts]
+memtool = "memtool:main"
+memtool-mcp = "mcp_server:main"
+memtool-web = "memtool_web:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["memtool", "memtool_core", "mcp_server", "memtool_web"]

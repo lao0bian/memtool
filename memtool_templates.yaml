@@ -1,0 +1,81 @@
+# memtool 记忆模板定义
+# 用于简化 Agent 记录信息的过程，降低认知负担
+
+templates:
+  error_analysis:
+    name: "错误分析"
+    description: "记录一个 bug 的发现、诊断和修复过程"
+    type: "run"
+    fields:
+      - name: error_code
+        type: string
+        required: true
+        description: "错误代码或异常类型（如 E404, NullPointerException）"
+      - name: component
+        type: string
+        required: true
+        description: "发生错误的组件/模块（如 router, database, cache）"
+      - name: root_cause
+        type: string
+        required: true
+        description: "根本原因分析"
+      - name: fix_applied
+        type: string
+        required: true
+        description: "应用的解决方案"
+      - name: test_case
+        type: string
+        required: false
+        description: "验证修复的测试用例（可选）"
+    # 自动生成的 key 模式，{} 中的变量会被替换为对应的字段值
+    auto_key: "error::{error_code}::{component}"
+    # 完整内容模板，用于生成实际内容
+    content_template: |
+      # 错误分析：{error_code} in {component}
+
+      ## 根本原因
+      {root_cause}
+
+      ## 应用的修复
+      {fix_applied}
+
+      ## 验证
+      {test_case}
+
+  design_decision:
+    name: "设计决策"
+    description: "记录一个架构或设计决策及其权衡"
+    type: "feature"
+    fields:
+      - name: feature
+        type: string
+        required: true
+        description: "特性或功能名称（如 caching, authentication）"
+      - name: aspect
+        type: string
+        required: true
+        description: "决策的方面（如 strategy, storage, ttl）"
+      - name: decision
+        type: string
+        required: true
+        description: "做出的决策"
+      - name: rationale
+        type: string
+        required: true
+        description: "决策的理由和权衡分析"
+      - name: alternatives
+        type: string
+        required: false
+        description: "考虑但被拒绝的替代方案（可选）"
+    auto_key: "decision::{feature}::{aspect}"
+    content_template: |
+      # 设计决策：{feature} - {aspect}
+
+      ## 决策
+      {decision}
+
+      ## 理由
+      {rationale}
+
+      ## 被拒绝的替代方案
+      {alternatives}
