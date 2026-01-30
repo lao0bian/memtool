@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS memory_items (
 CREATE INDEX IF NOT EXISTS idx_memory_type_key ON memory_items(type, key);
 CREATE INDEX IF NOT EXISTS idx_memory_task_step ON memory_items(task_id, step_id);
 CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory_items(updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_logical_key
+  ON memory_items(type, key, COALESCE(task_id, ''), COALESCE(step_id, ''));
 
 -- 可选：全文检索（FTS5）。如果宿主 SQLite 不支持，会在 init 时提示并自动降级为 LIKE。
 """
@@ -512,30 +514,45 @@ class MemoryStore:
                 action = "updated"
                 final_id = item_id
             else:
-                existing = find_by_logical_key(conn, type, key, task_id, step_id)
-                if existing:
-                    final_id = existing["id"]
-                    version = int(existing["version"]) + 1
-                    conn.execute("""
-                    UPDATE memory_items
-                    SET type=?, task_id=?, step_id=?, key=?, content=?, content_search=?, tags_json=?, source=?, weight=?, version=?, updated_at=?, confidence_level=?, verified_by=?
-                    WHERE id=?
-                    """, (
-                        type, task_id, step_id, key, content, content_search,
-                        tags_json, source, weight_value, version, now, confidence_level, verified_by, final_id
-                    ))
-                    action = "updated"
-                else:
-                    final_id = gen_id()
-                    version = 1
-                    conn.execute("""
-                    INSERT INTO memory_items(id, type, task_id, step_id, key, content, content_search, tags_json, source, weight, version, created_at, updated_at, confidence_level, verified_by)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (
-                        final_id, type, task_id, step_id, key, content, content_search,
-                        tags_json, source, weight_value, version, now, now, confidence_level, verified_by
-                    ))
-                    action = "inserted"
+                candidate_id = gen_id()
+                version = 1
+                conn.execute("""
+                INSERT INTO memory_items(
+                    id, type, task_id, step_id, key, content, content_search,
+                    tags_json, source, weight, version, created_at, updated_at,
+                    confidence_level, verified_by
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT DO UPDATE SET
+                    type = excluded.type,
+                    task_id = excluded.task_id,
+                    step_id = excluded.step_id,
+                    key = excluded.key,
+                    content = excluded.content,
+                    content_search = excluded.content_search,
+                    tags_json = excluded.tags_json,
+                    source = excluded.source,
+                    weight = excluded.weight,
+                    version = memory_items.version + 1,
+                    updated_at = excluded.updated_at,
+                    confidence_level = excluded.confidence_level,
+                    verified_by = excluded.verified_by
+                """, (
+                    candidate_id, type, task_id, step_id, key, content, content_search,
+                    tags_json, source, weight_value, version, now, now, confidence_level, verified_by
+                ))
+
+                row = find_by_logical_key(conn, type, key, task_id, step_id)
+                if row is None:
+                    raise MemtoolError({
+                        "ok": False,
+                        "error": "DB_ERROR",
+                        "message": "Upsert failed to find logical key after insert"
+                    }, 4)
+
+                final_id = row["id"]
+                version = int(row["version"])
+                action = "inserted" if final_id == candidate_id else "updated"
 
             conn.commit()
             result = {"ok": True, "action": action, "id": final_id, "version": version}
