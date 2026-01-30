@@ -249,7 +249,13 @@ def main():
                 limit=3,
                 include_stale=False
             )
-            for item in result.get("items", []):
+            if isinstance(result, dict):
+                items = result.get("items", [])
+            elif isinstance(result, list):
+                items = result
+            else:
+                items = []
+            for item in items:
                 if item["id"] not in seen_ids:
                     seen_ids.add(item["id"])
                     run_items.append(item)
