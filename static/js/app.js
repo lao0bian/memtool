@@ -1,4 +1,7 @@
 document.addEventListener('DOMContentLoaded', () => {
+    const totalMemoriesEl = document.getElementById('total-memories');
+    const latestUpdateEl = document.getElementById('latest-update');
+
     // =========================================================================
     // THEME SETUP & SWITCHER
     // =========================================================================
@@ -135,8 +138,12 @@ document.addEventListener('DOMContentLoaded', () => {
     async function loadSummaryStats() {
         const data = await fetchData(`${API_BASE}/stats/summary`);
         if (data) {
-            totalMemoriesEl.textContent = data.total_memories.toString().padStart(4, '0');
-            latestUpdateEl.textContent = data.latest_update ? new Date(data.latest_update).toLocaleTimeString('zh-CN', { hour12: false }) : '00:00:00';
+            if (totalMemoriesEl) {
+                totalMemoriesEl.textContent = data.total_memories.toString().padStart(4, '0');
+            }
+            if (latestUpdateEl) {
+                latestUpdateEl.textContent = data.latest_update ? new Date(data.latest_update).toLocaleTimeString('zh-CN', { hour12: false }) : '00:00:00';
+            }
         }
     }
 
