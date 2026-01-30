@@ -28,4 +28,12 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["memtool", "memtool_core", "mcp_server", "memtool_web"]
+py-modules = [
+  "memtool",
+  "memtool_core",
+  "memtool_lifecycle",
+  "memtool_rank",
+  "memtool_recommend",
+  "mcp_server",
+  "memtool_web"
+]

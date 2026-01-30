@@ -44,6 +44,31 @@ memtool-web
 - `MEMTOOL_DB`：共享数据库路径
 - `LOG_LEVEL`：日志级别（INFO/DEBUG）
 
+### Claude Code Hook（可选）
+UserPromptSubmit 事件自动注入相关记忆上下文：
+```bash
+hooks/memory_inject.py
+```
+环境变量：
+- `MEMTOOL_DB`：共享数据库路径
+- `MEMTOOL_HOOK_MAX_ITEMS`：最多注入条数（默认 3）
+- `MEMTOOL_HOOK_MAX_TOKENS`：检索 token 上限（默认 6）
+- `MEMTOOL_HOOK_MIN_TOKEN_LEN`：最小 token 长度（默认 2）
+- `MEMTOOL_HOOK_MIN_RELEVANCE`：相关度阈值（默认 0.25）
+说明：
+- 优先使用 FTS OR 查询；若缺少 jieba，则退化为“最近项扫描 + 子串匹配”。
+
+SessionEnd 事件会话结束总结并保存记忆：
+```bash
+hooks/session_end_memory_summary.py
+```
+环境变量：
+- `MEMTOOL_DB`：共享数据库路径
+- `MEMTOOL_HOOK_MIN_TURNS`：用户轮数阈值，仅当轮数 > N 时保存（默认 5）
+- `MEMTOOL_HOOK_SUMMARY_MODEL`：总结模型（默认 gpt-5.2）
+说明：
+- Stop Hook 已弃用，不再写入记忆。
+
 ## 2. 写入 / 更新（put）
 - `--id` 不填会自动生成
 - 同一个 `--id` 再 put 会更新并 version+1

@@ -1,83 +1,198 @@
-
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN" data-bs-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Memtool Dashboard</title>
+    <title>MEMTOOL // 指挥中心</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
     <link rel="stylesheet" href="/static/css/styles.css">
+    <script>
+        (function() {
+            const storedTheme = localStorage.getItem('memtool_theme') || 'dark';
+            document.documentElement.setAttribute('data-bs-theme', storedTheme);
+        })();
+    </script>
 </head>
-<body>
-    <header>
-        <h1>Memtool 记忆可视化仪表板</h1>
-        <div class="summary-bar">
-            <span>总记忆数: <strong id="total-memories">-</strong></span>
-            <span>最近更新: <strong id="latest-update">-</strong></span>
-        </div>
-    </header>
+<body class="tech-bg">
+    <div class="scanlines"></div>
 
-    <main>
-        <div class="charts-container">
-            <div class="chart-card">
-                <h2>记忆时间线 (按天)</h2>
-                <canvas id="timeline-chart"></canvas>
-            </div>
-            <div class="chart-card">
-                <h2>记忆类型分布</h2>
-                <canvas id="type-dist-chart"></canvas>
-            </div>
-            <div class="chart-card">
-                <h2>Top 10 标签</h2>
-                <canvas id="tag-top-chart"></canvas>
+    <nav class="navbar navbar-expand-lg sticky-top cyber-navbar">
+        <div class="container-fluid px-4">
+            <a class="navbar-brand tech-logo" href="#">
+                <span class="glitch-text" data-text="MEMTOOL">MEMTOOL</span>
+                <span class="version-tag">v2.1_ASYNC</span>
+            </a>
+            
+            <div class="ms-auto d-flex align-items-center">
+                <div class="stat-module me-4">
+                    <span class="label">总记忆数</span>
+                    <span class="value text-cyan" id="total-memories">0000</span>
+                </div>
+                <div class="stat-module me-4">
+                    <span class="label">最后更新</span>
+                    <span class="value" id="latest-update">00:00:00</span>
+                </div>
+                <button class="btn btn-cyber-sm" id="theme-toggle-btn">
+                    <i class="bi bi-sun-fill"></i>
+                </button>
             </div>
         </div>
+    </nav>
 
-        <div class="list-container">
-            <h2>记忆列表</h2>
-            <div class="filters">
-                <input type="text" id="filter-type" placeholder="类型 (e.g., project)">
-                <input type="text" id="filter-key" placeholder="键 (contains)">
-                <input type="text" id="filter-tag" placeholder="标签 (contains)">
-                <input type="text" id="filter-task-id" placeholder="Task ID">
-                <label for="filter-from">From:</label>
-                <input type="date" id="filter-from">
-                <label for="filter-to">To:</label>
-                <input type="date" id="filter-to">
-                <button id="filter-btn">Apply Filters</button>
-                <button id="reset-btn">Reset</button>
+    <main class="container-fluid px-4 py-4">
+        <div class="row g-4">
+            <!-- LEFT MAIN CONTROL (75%) -->
+            <div class="col-lg-9">
+                <!-- Main Timeline Monitor -->
+                <div class="cyber-card mb-4 main-monitor">
+                    <div class="cyber-card-header d-flex justify-content-between">
+                        <span><i class="bi bi-activity me-2"></i> 记忆增长趋势分析</span>
+                        <span class="text-secondary small">实时监控中...</span>
+                    </div>
+                    <div class="cyber-card-body">
+                        <div class="chart-wrapper-main">
+                            <canvas id="timeline-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Data Grid -->
+                <div class="cyber-card">
+                    <div class="cyber-card-header d-flex justify-content-between align-items-center">
+                        <span><i class="bi bi-grid-3x3-gap me-2"></i> 实时数据流</span>
+                        <div class="d-flex gap-2">
+                            <button class="btn btn-cyber-sm" type="button" data-bs-toggle="collapse" data-bs-target="#filterPanel">
+                                <i class="bi bi-terminal me-1"></i> 过滤器
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="collapse show" id="filterPanel">
+                        <div class="cyber-filter-panel border-bottom">
+                            <form id="filter-form" class="row g-3">
+                                <div class="col-md-3">
+                                    <div class="cyber-input-group">
+                                        <label>类型</label>
+                                        <input type="text" id="filter-type" placeholder="所有类型">
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="cyber-input-group">
+                                        <label>关键词</label>
+                                        <input type="text" id="filter-key" placeholder="搜索...">
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="cyber-input-group">
+                                        <label>标签</label>
+                                        <input type="text" id="filter-tag" placeholder="#">
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="cyber-input-group">
+                                        <label>任务 ID</label>
+                                        <input type="text" id="filter-task-id" placeholder="ID">
+                                    </div>
+                                </div>
+                                <div class="col-12 d-flex justify-content-end gap-3 pt-2">
+                                    <button type="button" id="reset-btn" class="btn btn-cyber-outline">重置</button>
+                                    <button type="button" id="filter-btn" class="btn btn-cyber">执行筛选</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+
+                    <div class="table-responsive cyber-table-container">
+                        <table id="memories-table" class="table table-dark table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th class="ps-4">UID</th>
+                                    <th>分类</th>
+                                    <th>标识符</th>
+                                    <th>上下文流</th>
+                                    <th>时间戳</th>
+                                    <th class="text-end pe-4">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <!-- STREAM -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
-            <table id="memories-table">
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Type</th>
-                        <th>Key</th>
-                        <th>Tags</th>
-                        <th>Task/Step</th>
-                        <th>Updated At</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <!-- Rows will be inserted by JavaScript -->
-                </tbody>
-            </table>
-        </div>
 
-        <div id="modal-backdrop" class="hidden">
-            <div id="modal-content">
-                <button id="modal-close-btn">&times;</button>
-                <h3>Memory Details</h3>
-                <pre id="modal-body"></pre>
+            <!-- RIGHT SIDEBAR (25%) -->
+            <div class="col-lg-3">
+                <!-- Type Distribution -->
+                <div class="cyber-card mb-4">
+                    <div class="cyber-card-header">
+                        <i class="bi bi-diagram-3 me-2"></i> 类型分布
+                    </div>
+                    <div class="cyber-card-body">
+                        <div class="chart-wrapper-side">
+                            <canvas id="type-dist-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Top Tags -->
+                <div class="cyber-card mb-4">
+                    <div class="cyber-card-header">
+                        <i class="bi bi-hash me-2"></i> 热门标签识别
+                    </div>
+                    <div class="cyber-card-body">
+                        <div class="chart-wrapper-side">
+                            <canvas id="tag-top-chart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- System Log / Status -->
+                <div class="cyber-card">
+                    <div class="cyber-card-header">
+                        <i class="bi bi-terminal me-2"></i> 系统日志
+                    </div>
+                    <div class="cyber-card-body font-monospace" style="font-size: 0.65rem; color: #4ade80;">
+                        <div class="mb-1">> 核心初始化_v2.1...</div>
+                        <div class="mb-1">> 同步神经数据库...</div>
+                        <div class="mb-1">> 加密数据流中...</div>
+                        <div class="text-white">> 状态: 待命</div>
+                    </div>
+                </div>
             </div>
         </div>
     </main>
 
-    <footer>
-        <p>Memtool Dashboard</p>
+    <footer class="footer mt-auto py-3 text-center text-muted">
+        <div class="container">
+            <span class="tech-text">操作员: <span class="text-white">BIAN_MK</span> // 系统状态: <span class="text-success">运行中</span></span>
+        </div>
     </footer>
 
-    <script src="/static/js/chart.umd.min.js"></script>
+    <!-- Tech Detail Modal -->
+    <div class="modal fade cyber-modal" id="memoryDetailModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-braces me-2"></i> 原始数据缓冲区</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="modal-body-content" class="p-4">
+                        <!-- Dynamic content will be injected here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 </html>
