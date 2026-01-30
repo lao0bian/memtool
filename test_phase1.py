@@ -33,7 +33,19 @@ def test_similarity_detection():
             content="E404 错误发生在路由器中，原因是连接超时，通过添加重试逻辑修复。",
         )
         assert result1["ok"], f"第一条记录写入失败: {result1}"
+        assert "warning" not in result1, f"首条记录不应触发重复检测: {result1}"
         print("✓ 第一条记录写入成功")
+
+        # 更新同一条记录（不应把自身当成重复）
+        result1_update = store.put(
+            item_id=result1["id"],
+            type="run",
+            key="error:E404:router",
+            content="E404 错误发生在路由器中，原因是连接超时，通过添加重试逻辑修复。",
+        )
+        assert result1_update["ok"], f"第一条记录更新失败: {result1_update}"
+        assert "warning" not in result1_update, f"更新自身不应触发重复检测: {result1_update}"
+        print("✓ 更新自身不触发重复检测")
 
         # 写入相似的记录（应该收到 warning）
         result2 = store.put(
