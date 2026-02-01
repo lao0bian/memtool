@@ -40,3 +40,11 @@ Thumbs.db
 # Environment variables
 .env
 .env.local
+
+# SQLite WAL files
+*.db-shm
+*.db-wal
+
+# Backup files
+*.bak
+*.bak2

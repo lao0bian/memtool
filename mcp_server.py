@@ -253,12 +253,12 @@ if FastMCP is not None:
                 step_id=step_id,
                 key=key,
                 tags=_normalize_tags(tags),
-                limit=limit_value + offset_value,
+                limit=limit_value,
+                offset=offset_value,
                 sort_by=sort_by,
                 include_stale=include_stale,
             )
-            items = rows[offset_value:] if offset_value else rows
-            return {"ok": True, "items": items, "limit": limit_value, "offset": offset_value}
+            return {"ok": True, "items": rows, "limit": limit_value, "offset": offset_value}
         except MemtoolError as e:
             return e.payload
         except Exception as e:
@@ -377,6 +377,120 @@ if FastMCP is not None:
             return e.payload
         except Exception as e:
             return _unexpected_error("memory_export", e)
+
+    @mcp.tool()
+    def memory_semantic_search(
+        query: str,
+        type: Optional[str] = None,
+        task_id: Optional[str] = None,
+        limit: int = 10,
+        min_score: float = 0.3,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Semantic vector search using embeddings.
+        
+        Uses local embedding model by default (BAAI/bge-small-zh-v1.5).
+        Configure with environment variables:
+        - MEMTOOL_EMBEDDING_PROVIDER: local, openai, or ollama
+        - MEMTOOL_EMBEDDING_MODEL: Override default model
+        - MEMTOOL_VECTOR_ENABLED: on, off, or auto
+        """
+        if not query or not str(query).strip():
+            return _param_error("query cannot be empty")
+        if type is not None and type not in _VALID_TYPES:
+            return _param_error("type must be one of: project, feature, run")
+        try:
+            limit_value = int(limit)
+        except (TypeError, ValueError):
+            return _param_error("limit must be an integer")
+        if limit_value < 1:
+            return _param_error("limit must be >= 1")
+
+        try:
+            store = _store_for(db_path)
+            return store.semantic_search(
+                query=str(query),
+                type=type,
+                task_id=task_id,
+                limit=limit_value,
+                min_score=min_score,
+            )
+        except MemtoolError as e:
+            return e.payload
+        except Exception as e:
+            return _unexpected_error("memory_semantic_search", e)
+
+    @mcp.tool()
+    def memory_hybrid_search(
+        query: str,
+        type: Optional[str] = None,
+        task_id: Optional[str] = None,
+        limit: int = 10,
+        fts_weight: float = 0.3,
+        vector_weight: float = 0.7,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Hybrid search combining FTS5 keyword search and vector semantic search.
+        
+        Best of both worlds: keyword matching + semantic understanding.
+        """
+        if not query or not str(query).strip():
+            return _param_error("query cannot be empty")
+        if type is not None and type not in _VALID_TYPES:
+            return _param_error("type must be one of: project, feature, run")
+        try:
+            limit_value = int(limit)
+        except (TypeError, ValueError):
+            return _param_error("limit must be an integer")
+        if limit_value < 1:
+            return _param_error("limit must be >= 1")
+
+        try:
+            store = _store_for(db_path)
+            return store.hybrid_search(
+                query=str(query),
+                type=type,
+                task_id=task_id,
+                limit=limit_value,
+                fts_weight=fts_weight,
+                vector_weight=vector_weight,
+            )
+        except MemtoolError as e:
+            return e.payload
+        except Exception as e:
+            return _unexpected_error("memory_hybrid_search", e)
+
+    @mcp.tool()
+    def memory_vector_sync(
+        force: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Sync all memories to vector index.
+        
+        Args:
+            force: If True, clear and rebuild entire index
+        """
+        try:
+            store = _store_for(db_path)
+            return store.vector_sync(force=force)
+        except MemtoolError as e:
+            return e.payload
+        except Exception as e:
+            return _unexpected_error("memory_vector_sync", e)
+
+    @mcp.tool()
+    def memory_vector_status(
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get vector search status and statistics."""
+        try:
+            store = _store_for(db_path)
+            return store.vector_status()
+        except MemtoolError as e:
+            return e.payload
+        except Exception as e:
+            return _unexpected_error("memory_vector_status", e)
+
 else:
     mcp = None
 

@@ -1,7 +1,7 @@
 [project]
 name = "memtool"
-version = "0.1.0"
-description = "SQLite-based memory tool (MVP) for agent workflows"
+version = "0.2.0"
+description = "SQLite-based memory tool with vector search for agent workflows"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -16,6 +16,22 @@ web = [
   "uvicorn[standard]",
   "jinja2",
   "python-multipart",
+]
+vector = [
+  "chromadb>=0.4.0",
+  "sentence-transformers>=2.2.0",
+]
+vector-openai = [
+  "chromadb>=0.4.0",
+  "openai>=1.0.0",
+]
+all = [
+  "fastapi",
+  "uvicorn[standard]",
+  "jinja2",
+  "python-multipart",
+  "chromadb>=0.4.0",
+  "sentence-transformers>=2.2.0",
 ]
 
 [project.scripts]

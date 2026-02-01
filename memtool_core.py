@@ -16,6 +16,16 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from memtool_lifecycle import DEFAULT_STALE_THRESHOLD, cleanup_candidates, lifecycle_meta
 from memtool_rank import score_item
 from memtool_recommend import recommend_items
+from memtool.storage.connection import SQLiteConnectionPool
+from memtool.utils import _extract_keywords
+
+# Try to import semantic search mixin
+try:
+    from memtool.embedding.semantic import SemanticSearchMixin
+    _HAS_VECTOR = True
+except ImportError:
+    SemanticSearchMixin = object  # type: ignore
+    _HAS_VECTOR = False
 
 DEFAULT_DB = os.environ.get("MEMTOOL_DB", "./memtool.db")
 _SCHEMA_LOCK = threading.Lock()
@@ -70,6 +80,8 @@ CREATE TABLE IF NOT EXISTS memory_items (
 CREATE INDEX IF NOT EXISTS idx_memory_type_key ON memory_items(type, key);
 CREATE INDEX IF NOT EXISTS idx_memory_task_step ON memory_items(task_id, step_id);
 CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory_items(updated_at);
+CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_items(type);
+CREATE INDEX IF NOT EXISTS idx_memory_weight ON memory_items(weight);
 
 -- 可选：全文检索（FTS5）。如果宿主 SQLite 不支持，会在 init 时提示并自动降级为 LIKE。
 """
@@ -125,6 +137,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> bool:
     added_column = _ensure_content_search_column(conn)
     _ensure_confidence_level_column(conn)  # 添加 confidence_level 列
     _ensure_verified_by_column(conn)  # 添加 verified_by 列
+    
+    # Create index on confidence_level after ensuring the column exists
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_confidence ON memory_items(confidence_level)")
 
     needs_backfill = added_column
     if not needs_backfill:
@@ -204,12 +219,26 @@ def parse_tags(tags: Optional[List[str]]) -> List[str]:
     return dedup
 
 
+_jieba = None
+
+
+def _get_jieba():
+    """获取 jieba 实例（带缓存）"""
+    global _jieba
+    if _jieba is None:
+        try:
+            import jieba
+            _jieba = jieba
+        except ImportError:
+            _jieba = False
+    return _jieba if _jieba else None
+
+
 def _tokenize_for_search(content: str) -> List[str]:
     if not content:
         return []
-    try:
-        import jieba
-    except Exception:
+    jieba = _get_jieba()
+    if jieba is None:
         return []
     tokens: List[str] = []
     seen = set()
@@ -235,18 +264,7 @@ def _jaccard_similarity(set1: set, set2: set) -> float:
     return intersection / union if union > 0 else 0.0
 
 
-def _extract_keywords(content: str) -> set:
-    """从内容中提取关键词集合（不依赖 jieba）"""
-    if not content:
-        return set()
-
-    # 简单的分词：按空格、标点符号分割
-    import re
-    # 保留中文、英文、数字，其他作为分隔符
-    words = re.findall(r'[\u4e00-\u9fff]+|\w+', content.lower())
-    # 过滤太短的词（< 2个字符）
-    keywords = {w for w in words if len(w) >= _MIN_TOKEN_LEN}
-    return keywords
+# _extract_keywords moved to memtool.utils
 
 
 def _build_content_search(content: str) -> str:
@@ -394,10 +412,29 @@ def _raise_db_error(e: sqlite3.Error) -> None:
     raise MemtoolError(_db_error_payload(e), 4)
 
 
-class MemoryStore:
+class MemoryStore(SemanticSearchMixin):
+    """Memory storage with SQLite backend and optional vector search
+    
+    Vector search is enabled when:
+    - MEMTOOL_VECTOR_ENABLED=on (force enable)
+    - MEMTOOL_VECTOR_ENABLED=auto (enable if dependencies available)
+    - MEMTOOL_VECTOR_ENABLED=off (disable)
+    
+    Environment variables:
+    - MEMTOOL_VECTOR_DIR: Vector storage directory (default: alongside db)
+    - MEMTOOL_EMBEDDING_PROVIDER: local, openai, or ollama
+    - MEMTOOL_EMBEDDING_MODEL: Override default model
+    """
+    
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
         _ensure_schema_once(db_path)
+        # Initialize connection pool for better performance
+        self._pool = SQLiteConnectionPool(db_path)
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Get database connection from pool (thread-safe)"""
+        return self._pool.get_connection()
 
     def init_db(self) -> Dict[str, Any]:
         return init_db(self._db_path)
@@ -426,7 +463,7 @@ class MemoryStore:
 
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
 
             # 提取查询内容的关键词
             query_keywords = _extract_keywords(content)
@@ -462,9 +499,6 @@ class MemoryStore:
 
         except sqlite3.Error as e:
             return []  # 相似度检查不应该因为 DB 错误而失败，直接返回空
-        finally:
-            if conn is not None:
-                conn.close()
 
     def put(
         self,
@@ -483,7 +517,7 @@ class MemoryStore:
     ) -> Dict[str, Any]:
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
             now = utcnow_iso()
             tags_json = json.dumps(tags or [], ensure_ascii=False)
             weight_value = _coerce_weight(weight)
@@ -540,6 +574,24 @@ class MemoryStore:
             conn.commit()
             result = {"ok": True, "action": action, "id": final_id, "version": version}
 
+            # Auto-index to vector store if available
+            if _HAS_VECTOR:
+                try:
+                    self.vector_index({
+                        "id": final_id,
+                        "content": content,
+                        "type": type,
+                        "key": key,
+                        "task_id": task_id,
+                        "step_id": step_id,
+                        "tags": tags or [],
+                        "weight": weight_value,
+                        "confidence_level": confidence_level,
+                        "updated_at": now,
+                    })
+                except Exception:
+                    pass  # Don't fail put if vector indexing fails
+
             # 相似度检查：在 insert 或 update 后，检查是否有类似的记录
             similar_items = self.find_similar_items(content, type=type, threshold=0.8, limit=3)
             if similar_items:
@@ -557,10 +609,9 @@ class MemoryStore:
             return result
 
         except sqlite3.Error as e:
-            _raise_db_error(e)
-        finally:
             if conn is not None:
-                conn.close()
+                conn.rollback()
+            _raise_db_error(e)
 
         return {"ok": False, "error": "UNKNOWN"}
 
@@ -575,7 +626,7 @@ class MemoryStore:
     ) -> Dict[str, Any]:
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
             if item_id:
                 row = conn.execute("SELECT * FROM memory_items WHERE id = ?", (item_id,)).fetchone()
                 if row is None:
@@ -607,9 +658,6 @@ class MemoryStore:
 
         except sqlite3.Error as e:
             _raise_db_error(e)
-        finally:
-            if conn is not None:
-                conn.close()
 
         return {"ok": False, "error": "UNKNOWN"}
 
@@ -622,13 +670,14 @@ class MemoryStore:
         key: Optional[str] = None,
         tags: Optional[List[str]] = None,
         limit: int = 50,
+        offset: int = 0,
         sort_by: str = "updated",
         include_stale: bool = True,
         stale_threshold: float = DEFAULT_STALE_THRESHOLD,
     ) -> List[Dict[str, Any]]:
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
             where = []
             params: List[Any] = []
             if type:
@@ -651,11 +700,22 @@ class MemoryStore:
             sql = "SELECT * FROM memory_items"
             if where:
                 sql += " WHERE " + " AND ".join(where)
-            sql += " ORDER BY updated_at DESC LIMIT ?"
+            sql += " ORDER BY updated_at DESC"
+            
+            # Use SQL LIMIT and OFFSET for better performance
             fetch_limit = int(limit)
+            fetch_offset = int(offset)
             if sort_by in {"confidence", "recency", "mixed"}:
+                # For complex sorting, fetch more rows and sort in memory
                 fetch_limit = min(max(fetch_limit * 5, 200), 1000)
-            params.append(fetch_limit)
+                fetch_offset = 0  # Can't use offset with complex sorting
+                sql += " LIMIT ?"
+                params.append(fetch_limit)
+            else:
+                # For simple sorting, use SQL LIMIT OFFSET
+                sql += " LIMIT ? OFFSET ?"
+                params.append(fetch_limit)
+                params.append(fetch_offset)
 
             rows = conn.execute(sql, tuple(params)).fetchall()
             items = [_row_to_obj(r) for r in rows]
@@ -675,13 +735,16 @@ class MemoryStore:
             elif sort_by == "mixed":
                 items.sort(key=lambda x: (x.get("mixed_score", 0.0), x.get("updated_at") or ""), reverse=True)
 
-            return items[: int(limit)]
+            # For complex sorting, apply offset after sorting
+            if sort_by in {"confidence", "recency", "mixed"}:
+                items = items[fetch_offset:fetch_offset + int(limit)]
+            else:
+                items = items[:int(limit)]
+
+            return items
 
         except sqlite3.Error as e:
             _raise_db_error(e)
-        finally:
-            if conn is not None:
-                conn.close()
 
         return []
 
@@ -704,7 +767,7 @@ class MemoryStore:
 
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
             fts_ok = True
             try:
                 conn.execute("SELECT 1 FROM memory_fts LIMIT 1;").fetchone()
@@ -781,25 +844,21 @@ class MemoryStore:
 
         except sqlite3.Error as e:
             _raise_db_error(e)
-        finally:
-            if conn is not None:
-                conn.close()
 
         return {"ok": False, "error": "UNKNOWN", "items": []}
 
     def delete(self, *, item_id: str) -> Dict[str, Any]:
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
             cur = conn.execute("DELETE FROM memory_items WHERE id = ?", (item_id,))
             conn.commit()
             return {"ok": True, "deleted": cur.rowcount}
 
         except sqlite3.Error as e:
-            _raise_db_error(e)
-        finally:
             if conn is not None:
-                conn.close()
+                conn.rollback()
+            _raise_db_error(e)
 
         return {"ok": False, "error": "UNKNOWN"}
 
@@ -817,7 +876,7 @@ class MemoryStore:
     ) -> Dict[str, Any]:
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
             where = []
             params: List[Any] = []
             if type:
@@ -853,9 +912,6 @@ class MemoryStore:
             return {"ok": True, "items": recs, "candidates": len(items), "limit": int(limit)}
         except sqlite3.Error as e:
             _raise_db_error(e)
-        finally:
-            if conn is not None:
-                conn.close()
 
         return {"ok": False, "error": "UNKNOWN"}
 
@@ -877,7 +933,7 @@ class MemoryStore:
 
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
             where = []
             params: List[Any] = []
             if type:
@@ -911,29 +967,23 @@ class MemoryStore:
             }
         except sqlite3.Error as e:
             _raise_db_error(e)
-        finally:
-            if conn is not None:
-                conn.close()
 
     def export_items(self) -> List[Dict[str, Any]]:
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
             rows = conn.execute("SELECT * FROM memory_items ORDER BY updated_at ASC").fetchall()
             return [_row_to_obj(r) for r in rows]
 
         except sqlite3.Error as e:
             _raise_db_error(e)
-        finally:
-            if conn is not None:
-                conn.close()
 
         return []
 
     def import_items(self, items: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         conn: Optional[sqlite3.Connection] = None
         try:
-            conn = connect(self._db_path)
+            conn = self._get_conn()
             now = utcnow_iso()
             inserted = 0
             updated = 0
@@ -990,8 +1040,5 @@ class MemoryStore:
 
         except sqlite3.Error as e:
             _raise_db_error(e)
-        finally:
-            if conn is not None:
-                conn.close()
 
         return {"ok": False, "error": "UNKNOWN"}

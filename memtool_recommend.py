@@ -6,21 +6,11 @@ Recommendation helpers
 from __future__ import annotations
 
 import datetime as _dt
-import re
 from typing import List, Optional, Set
 
 from memtool_lifecycle import DEFAULT_STALE_THRESHOLD, decay_score, lifecycle_meta
 from memtool_rank import confidence_score
-
-
-_MIN_TOKEN_LEN = 2
-
-
-def _extract_keywords(content: Optional[str]) -> Set[str]:
-    if not content:
-        return set()
-    words = re.findall(r"[\u4e00-\u9fff]+|\w+", content.lower())
-    return {w for w in words if len(w) >= _MIN_TOKEN_LEN}
+from memtool.utils import _extract_keywords
 
 
 def _jaccard_similarity(set1: Set[str], set2: Set[str]) -> float:
