@@ -74,7 +74,11 @@ CREATE TABLE IF NOT EXISTS memory_items (
   weight REAL NOT NULL DEFAULT 1.0,
   version INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  -- Phase 2-1: Memory Consolidation Fields
+  access_count INTEGER NOT NULL DEFAULT 0,
+  last_accessed_at TEXT,
+  consolidation_score REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_type_key ON memory_items(type, key);
@@ -85,6 +89,16 @@ CREATE INDEX IF NOT EXISTS idx_memory_weight ON memory_items(weight);
 
 -- 可选：全文检索（FTS5）。如果宿主 SQLite 不支持，会在 init 时提示并自动降级为 LIKE。
 """
+
+
+def _ensure_phase2_indexes(conn: sqlite3.Connection) -> None:
+    """Phase 2-1: 创建记忆巩固字段的索引（仅当字段存在时）"""
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_access_count ON memory_items(access_count)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_consolidation ON memory_items(consolidation_score)")
+    except sqlite3.OperationalError:
+        # 字段还不存在，稍后会添加
+        pass
 
 
 def _fts_status(conn: sqlite3.Connection) -> Tuple[bool, bool]:
@@ -137,9 +151,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> bool:
     added_column = _ensure_content_search_column(conn)
     _ensure_confidence_level_column(conn)  # 添加 confidence_level 列
     _ensure_verified_by_column(conn)  # 添加 verified_by 列
+    _ensure_phase2_columns(conn)  # Phase 2-1: 添加记忆巩固字段
     
-    # Create index on confidence_level after ensuring the column exists
+    # Create indexes after ensuring columns exist
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_confidence ON memory_items(confidence_level)")
+    _ensure_phase2_indexes(conn)  # Phase 2-1: 创建巩固字段的索引
 
     needs_backfill = added_column
     if not needs_backfill:
@@ -304,6 +320,25 @@ def _ensure_verified_by_column(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def _ensure_phase2_columns(conn: sqlite3.Connection) -> bool:
+    """Phase 2-1: 添加记忆巩固字段"""
+    added = False
+    
+    if not _column_exists(conn, "memory_items", "access_count"):
+        conn.execute("ALTER TABLE memory_items ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0")
+        added = True
+    
+    if not _column_exists(conn, "memory_items", "last_accessed_at"):
+        conn.execute("ALTER TABLE memory_items ADD COLUMN last_accessed_at TEXT")
+        added = True
+    
+    if not _column_exists(conn, "memory_items", "consolidation_score"):
+        conn.execute("ALTER TABLE memory_items ADD COLUMN consolidation_score REAL NOT NULL DEFAULT 0.0")
+        added = True
+    
+    return added
+
+
 def _backfill_content_search(conn: sqlite3.Connection) -> int:
     cur = conn.execute("""
     SELECT id, content FROM memory_items
@@ -385,6 +420,22 @@ def _row_to_obj(r: sqlite3.Row) -> Dict[str, Any]:
     except (KeyError, IndexError):
         obj["verified_by"] = None
 
+    # Phase 2-1: 添加记忆巩固字段
+    try:
+        obj["access_count"] = r["access_count"]
+    except (KeyError, IndexError):
+        obj["access_count"] = 0
+
+    try:
+        obj["last_accessed_at"] = r["last_accessed_at"]
+    except (KeyError, IndexError):
+        obj["last_accessed_at"] = None
+
+    try:
+        obj["consolidation_score"] = r["consolidation_score"]
+    except (KeyError, IndexError):
+        obj["consolidation_score"] = 0.0
+
     return obj
 
 
@@ -435,6 +486,101 @@ class MemoryStore(SemanticSearchMixin):
     def _get_conn(self) -> sqlite3.Connection:
         """Get database connection from pool (thread-safe)"""
         return self._pool.get_connection()
+
+    def _compute_consolidation(
+        self,
+        access_count: int,
+        created_at: str,
+        updated_at: str,
+        now: Optional[_dt.datetime] = None
+    ) -> float:
+        """
+        Phase 2-1: 计算记忆巩固分数
+        
+        巩固分数 = 访问频率分 × 时间权重
+        
+        - 访问频率分: log(1 + access_count) 归一化到 0-1
+        - 时间权重: 考虑创建时间和最近更新时间
+        
+        Returns:
+            float: 巩固分数 (0.0 - 1.0)
+        """
+        if now is None:
+            now = _dt.datetime.now(tz=_dt.timezone.utc)
+        
+        # 访问频率分 (对数增长，避免线性爆炸)
+        # access_count=0 → 0.0, access_count=100 → 1.0
+        import math
+        frequency_score = min(math.log(1 + access_count) / math.log(100), 1.0)
+        
+        # 时间跨度分 (存在越久 = 越重要)
+        created_dt = _dt.datetime.fromisoformat(created_at)
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=_dt.timezone.utc)
+        age_days = (now - created_dt).total_seconds() / 86400.0
+        longevity_score = min(age_days / 365.0, 1.0)
+        
+        # 活跃度分 (最近有更新 = 仍在使用)
+        from memtool_lifecycle import decay_score
+        recency = decay_score(updated_at, "feature", now=now)
+        
+        # 综合巩固分数
+        consolidation = (
+            frequency_score * 0.5 +
+            longevity_score * 0.2 +
+            recency * 0.3
+        )
+        
+        return consolidation
+
+    def _track_access(self, item_id: str) -> None:
+        """
+        Phase 2-1: 记录访问，更新巩固分数
+        
+        在以下场景触发：
+        - get() 方法调用时
+        - search() 返回的每个结果
+        - recommend() 返回的每个结果
+        """
+        # 使用新连接以避免事务冲突
+        conn = None
+        try:
+            conn = connect(self._db_path)
+            now = utcnow_iso()
+            
+            # 更新访问记录
+            conn.execute("""
+                UPDATE memory_items
+                SET access_count = access_count + 1,
+                    last_accessed_at = ?
+                WHERE id = ?
+            """, (now, item_id))
+            
+            # 重新计算巩固分数
+            row = conn.execute(
+                "SELECT access_count, created_at, updated_at FROM memory_items WHERE id = ?",
+                (item_id,)
+            ).fetchone()
+            
+            if row:
+                consolidation = self._compute_consolidation(
+                    access_count=row["access_count"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"]
+                )
+                conn.execute(
+                    "UPDATE memory_items SET consolidation_score = ? WHERE id = ?",
+                    (consolidation, item_id)
+                )
+            
+            conn.commit()
+        except sqlite3.Error:
+            # 访问追踪失败不应影响主流程
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
 
     def init_db(self) -> Dict[str, Any]:
         return init_db(self._db_path)
@@ -631,6 +777,8 @@ class MemoryStore(SemanticSearchMixin):
                 row = conn.execute("SELECT * FROM memory_items WHERE id = ?", (item_id,)).fetchone()
                 if row is None:
                     raise MemtoolError({"ok": False, "error": "NOT_FOUND", "id": item_id}, 3)
+                # Phase 2-1: 追踪访问
+                self._track_access(item_id)
                 return _row_to_obj(row)
 
             where = ["type = ?", "key = ?"]
@@ -654,6 +802,8 @@ class MemoryStore(SemanticSearchMixin):
                     "error": "NOT_FOUND",
                     "query": {"type": type, "key": key, "task_id": task_id, "step_id": step_id}
                 }, 3)
+            # Phase 2-1: 追踪访问
+            self._track_access(row["id"])
             return _row_to_obj(row)
 
         except sqlite3.Error as e:
@@ -840,6 +990,10 @@ class MemoryStore(SemanticSearchMixin):
             elif sort_by == "mixed":
                 items.sort(key=lambda x: (x.get("mixed_score", 0.0), x.get("updated_at") or ""), reverse=True)
 
+            # Phase 2-1: 追踪访问（对搜索结果）
+            for item in items[:int(limit)]:
+                self._track_access(item["id"])
+
             return {"ok": True, "fts5": fts_ok, "items": items[: int(limit)]}
 
         except sqlite3.Error as e:
@@ -909,6 +1063,11 @@ class MemoryStore(SemanticSearchMixin):
                 include_stale=include_stale,
                 stale_threshold=stale_threshold,
             )
+            
+            # Phase 2-1: 追踪访问（对推荐结果）
+            for item in recs:
+                self._track_access(item["id"])
+            
             return {"ok": True, "items": recs, "candidates": len(items), "limit": int(limit)}
         except sqlite3.Error as e:
             _raise_db_error(e)

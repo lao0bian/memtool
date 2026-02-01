@@ -59,6 +59,135 @@ def _store_for(db_path: Optional[str]) -> MemoryStore:
     return MemoryStore(path)
 
 
+def assess_knowledge(
+    topic: str,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Phase 2-1: 评估 Agent 对某个主题的记忆可信度（元认知）
+    
+    独立函数版本，可供测试和其他模块使用
+    """
+    if not topic or not str(topic).strip():
+        return _param_error("topic cannot be empty")
+    
+    try:
+        store = _store_for(db_path)
+        
+        # 搜索相关记忆（使用 hybrid 搜索更准确）
+        try:
+            results = store.hybrid_search(query=str(topic), limit=50)
+        except Exception:
+            # Fallback to regular search if hybrid not available
+            results = store.search(query=str(topic), limit=50)
+        
+        items = results.get("items", [])
+        
+        if not items:
+            return {
+                "ok": True,
+                "confidence": "none",
+                "score": 0.0,
+                "message": f"我对「{topic}」没有记忆",
+                "suggestions": [
+                    "建议通过 web_search 或查阅文档获取信息",
+                    "获取信息后用 memory_store 记录"
+                ],
+                "evidence": [],
+                "stats": {
+                    "total_memories": 0,
+                    "avg_confidence": 0.0,
+                    "avg_recency": 0.0,
+                    "avg_consolidation": 0.0,
+                    "coverage": 0.0
+                }
+            }
+        
+        # 计算元认知分数
+        from memtool_rank import score_item
+        import datetime as dt
+        now = dt.datetime.now(tz=dt.timezone.utc)
+        
+        # 为每个 item 计算分数（如果还没有）
+        for item in items:
+            if "confidence_score" not in item:
+                item.update(score_item(item, now=now))
+        
+        avg_confidence = sum(item.get("confidence_score", 0.6) for item in items) / len(items)
+        coverage = min(len(items) / 10.0, 1.0)  # 10 条记忆 = 完整覆盖
+        avg_recency = sum(item.get("recency_score", 0.5) for item in items) / len(items)
+        avg_consolidation = sum(item.get("consolidation_score", 0.0) for item in items) / len(items)
+        
+        # 综合元认知分数
+        meta_score = (
+            avg_confidence * 0.35 +
+            coverage * 0.25 +
+            avg_recency * 0.20 +
+            avg_consolidation * 0.20
+        )
+        
+        # 分级评估
+        if meta_score >= 0.8:
+            level = "high"
+            message = f"我对「{topic}」很有把握，有 {len(items)} 条相关记忆"
+            suggestions = ["可以直接使用这些记忆回答问题"]
+        elif meta_score >= 0.5:
+            level = "medium"
+            message = f"我对「{topic}」有一些了解，但不完全确定"
+            suggestions = [
+                "建议交叉验证这些记忆",
+                "如果是关键决策，最好查询最新资料"
+            ]
+        elif meta_score >= 0.2:
+            level = "low"
+            message = f"我对「{topic}」的记忆比较模糊"
+            suggestions = [
+                "记忆可能过时或不完整",
+                "建议重新学习或查询外部资源",
+                f"找到 {len(items)} 条记忆但质量较低"
+            ]
+        else:
+            level = "very_low"
+            message = f"我对「{topic}」几乎没有可靠记忆"
+            suggestions = [
+                "强烈建议查询外部资源",
+                "获取新信息后更新记忆库"
+            ]
+        
+        # 提取高质量证据
+        evidence = sorted(items, key=lambda x: x.get("confidence_score", 0), reverse=True)[:5]
+        
+        return {
+            "ok": True,
+            "confidence": level,
+            "score": round(meta_score, 4),
+            "message": message,
+            "suggestions": suggestions,
+            "evidence": [
+                {
+                    "id": e["id"],
+                    "key": e["key"],
+                    "confidence_level": e.get("confidence_level"),
+                    "access_count": e.get("access_count", 0),
+                    "consolidation_score": round(e.get("consolidation_score", 0.0), 3),
+                    "updated_at": e.get("updated_at"),
+                    "snippet": e.get("content", "")[:100] + "..."
+                }
+                for e in evidence
+            ],
+            "stats": {
+                "total_memories": len(items),
+                "avg_confidence": round(avg_confidence, 3),
+                "avg_recency": round(avg_recency, 3),
+                "avg_consolidation": round(avg_consolidation, 3),
+                "coverage": round(coverage, 3)
+            }
+        }
+    except MemtoolError as e:
+        return e.payload
+    except Exception as e:
+        return _unexpected_error("assess_knowledge", e)
+
+
 def _param_error(message: str, hint: str = "") -> Dict[str, Any]:
     payload: Dict[str, Any] = {"ok": False, "error": "PARAM_ERROR", "message": message}
     if hint:
@@ -490,6 +619,30 @@ if FastMCP is not None:
             return e.payload
         except Exception as e:
             return _unexpected_error("memory_vector_status", e)
+
+    @mcp.tool()
+    def memory_assess_knowledge(
+        topic: str,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Phase 2-1: 评估 Agent 对某个主题的记忆可信度（元认知）
+        
+        通过综合分析相关记忆的质量、数量、新鲜度和巩固程度，
+        评估 Agent 对某个主题的掌握程度。
+        
+        Args:
+            topic: 要评估的主题
+            db_path: 数据库路径（可选）
+        
+        Returns:
+            - confidence: "high" | "medium" | "low" | "none"
+            - score: 元认知分数 (0.0 - 1.0)
+            - message: 人类可读的评估
+            - suggestions: 改进建议列表
+            - evidence: 支撑证据列表（最多5条高质量记忆）
+            - stats: 统计数据
+        """
+        return assess_knowledge(topic, db_path)
 
 else:
     mcp = None
