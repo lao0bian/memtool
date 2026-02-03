@@ -19,11 +19,13 @@ web = [
 ]
 vector = [
   "chromadb>=0.4.0",
+  "packaging>=23.0",
   "sentence-transformers>=2.2.0",
 ]
 vector-openai = [
   "chromadb>=0.4.0",
   "openai>=1.0.0",
+  "packaging>=23.0",
 ]
 all = [
   "fastapi",
@@ -31,6 +33,7 @@ all = [
   "jinja2",
   "python-multipart",
   "chromadb>=0.4.0",
+  "packaging>=23.0",
   "sentence-transformers>=2.2.0",
 ]
 

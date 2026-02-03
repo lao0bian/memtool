@@ -17,6 +17,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from packaging import version as pkg_version
+
 from .embedder import Embedder, get_embedder
 
 logger = logging.getLogger(__name__)
@@ -49,38 +51,77 @@ class VectorStore:
         self._collection = None
         
     def _ensure_client(self):
-        """Lazy initialization of ChromaDB client"""
+        """Lazy initialization with version-safe API selection"""
         if self._client is not None:
             return
-            
+
         try:
             import chromadb
-            from chromadb.config import Settings
         except ImportError:
             raise ImportError(
                 "chromadb is required for vector search. "
                 "Install with: pip install chromadb"
             )
-        
+
         self._persist_dir.mkdir(parents=True, exist_ok=True)
-        
-        self._client = chromadb.Client(Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=str(self._persist_dir),
-            anonymized_telemetry=False
-        ))
-        
-        # Get or create collection
+
+        try:
+            chroma_ver = pkg_version.parse(chromadb.__version__)
+            use_new_api = chroma_ver >= pkg_version.parse("0.4.0")
+        except Exception:
+            use_new_api = True
+            logger.warning(
+                "Failed to parse ChromaDB version: %s, assuming >= 0.4",
+                getattr(chromadb, "__version__", "unknown"),
+            )
+
+        if use_new_api:
+            self._init_persistent_client()
+        else:
+            self._init_legacy_client()
+
+        logger.info(
+            "Initialized VectorStore: %s, collection=%s, count=%s",
+            self._persist_dir,
+            self._collection_name,
+            self._collection.count(),
+        )
+
+    def _init_persistent_client(self) -> None:
+        """ChromaDB 0.4+ API"""
+        import chromadb
+        from chromadb.config import Settings
+
+        self._client = chromadb.PersistentClient(
+            path=str(self._persist_dir),
+            settings=Settings(
+                anonymized_telemetry=False,
+                allow_reset=True,
+            ),
+        )
         self._collection = self._client.get_or_create_collection(
             name=self._collection_name,
-            metadata={"hnsw:space": "cosine"}
+            metadata={"hnsw:space": "cosine"},
         )
-        
-        logger.info(
-            f"Initialized VectorStore: {self._persist_dir}, "
-            f"collection={self._collection_name}, "
-            f"count={self._collection.count()}"
+        logger.info("Initialized ChromaDB (new API): %s", self._persist_dir)
+
+    def _init_legacy_client(self) -> None:
+        """ChromaDB < 0.4 API (deprecated)"""
+        import chromadb
+        from chromadb.config import Settings
+
+        self._client = chromadb.Client(
+            Settings(
+                chroma_db_impl="duckdb+parquet",
+                persist_directory=str(self._persist_dir),
+                anonymized_telemetry=False,
+            )
         )
+        self._collection = self._client.get_or_create_collection(
+            name=self._collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        logger.info("Initialized ChromaDB (legacy API): %s", self._persist_dir)
     
     def add(
         self,

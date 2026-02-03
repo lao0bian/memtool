@@ -12,6 +12,8 @@ import sys
 import threading
 from typing import Any, Dict, List, Optional
 
+from memtool.observability import compute_stats, health_check
+from memtool.history import get_history
 from memtool_core import DEFAULT_DB, MemtoolError, MemoryStore, init_db
 
 try:
@@ -621,6 +623,36 @@ if FastMCP is not None:
             return _unexpected_error("memory_vector_status", e)
 
     @mcp.tool()
+    def memory_stats(
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get basic memory statistics."""
+        try:
+            store = _store_for(db_path)
+            stats = compute_stats(store)
+            return {"ok": True, **stats}
+        except MemtoolError as e:
+            return e.payload
+        except Exception as e:
+            return _unexpected_error("memory_stats", e)
+
+    @mcp.tool()
+    def memory_health_check(
+        thresholds: Optional[Dict[str, float]] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Check memory health with optional thresholds."""
+        if thresholds is not None and not isinstance(thresholds, dict):
+            return _param_error("thresholds must be a dict")
+        try:
+            store = _store_for(db_path)
+            return health_check(store, thresholds=thresholds)
+        except MemtoolError as e:
+            return e.payload
+        except Exception as e:
+            return _unexpected_error("memory_health_check", e)
+
+    @mcp.tool()
     def memory_assess_knowledge(
         topic: str,
         db_path: Optional[str] = None,
@@ -643,6 +675,78 @@ if FastMCP is not None:
             - stats: 统计数据
         """
         return assess_knowledge(topic, db_path)
+
+    @mcp.tool()
+    def memory_history(
+        item_id: str,
+        limit: int = 10,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Phase 2.6: 查看记忆的版本历史
+        
+        Args:
+            item_id: 记忆的 ID
+            limit: 最多返回多少条历史记录（默认 10）
+            db_path: 可选的数据库路径
+            
+        Returns:
+            包含版本历史的字典
+            
+        Example:
+            memory_history(item_id="abc123")
+            → {"ok": True, "history": [{"version": 2, "content": "..."}]}
+        """
+        if not item_id or not str(item_id).strip():
+            return _param_error("item_id cannot be empty")
+        
+        try:
+            store = _store_for(db_path)
+            return get_history(store, str(item_id).strip(), limit=limit)
+        except MemtoolError as e:
+            return e.payload
+        except Exception as e:
+            return _unexpected_error("memory_history", e)
+
+    @mcp.tool()
+    def memory_suggest_merge(
+        type: Optional[str] = None,
+        threshold: float = 0.85,
+        limit: int = 10,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Phase 2.6: 找出可能需要合并的相似记忆
+        
+        扫描记忆库，找出高相似度的记忆对，建议合并以减少冗余。
+        
+        Args:
+            type: 可选，仅在该 type 中搜索
+            threshold: 相似度阈值（默认 0.85，即 85%）
+            limit: 最多返回多少组建议（默认 10）
+            db_path: 可选的数据库路径
+            
+        Returns:
+            合并建议列表
+            
+        Example:
+            memory_suggest_merge(type="project", threshold=0.9)
+        """
+        from memtool.merge import suggest_merges
+        
+        if type is not None and type not in _VALID_TYPES:
+            return _param_error("type must be one of: project, feature, run")
+        
+        try:
+            store = _store_for(db_path)
+            return suggest_merges(
+                store,
+                type=type,
+                threshold=threshold,
+                limit=limit
+            )
+        except MemtoolError as e:
+            return e.payload
+        except Exception as e:
+            return _unexpected_error("memory_suggest_merge", e)
 
 else:
     mcp = None

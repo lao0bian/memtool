@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -31,6 +32,7 @@ DEFAULT_DB = os.environ.get("MEMTOOL_DB", "./memtool.db")
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_READY: set[str] = set()
 _MIN_TOKEN_LEN = 2
+logger = logging.getLogger(__name__)
 
 
 class MemtoolError(Exception):
@@ -152,6 +154,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> bool:
     _ensure_confidence_level_column(conn)  # 添加 confidence_level 列
     _ensure_verified_by_column(conn)  # 添加 verified_by 列
     _ensure_phase2_columns(conn)  # Phase 2-1: 添加记忆巩固字段
+    _ensure_history_table(conn)  # Phase 2.6: 添加历史表
     
     # Create indexes after ensuring columns exist
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_confidence ON memory_items(confidence_level)")
@@ -339,6 +342,57 @@ def _ensure_phase2_columns(conn: sqlite3.Connection) -> bool:
     return added
 
 
+def _ensure_history_table(conn: sqlite3.Connection) -> bool:
+    """Phase 2.6: 确保 memory_history 表存在"""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS memory_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            weight REAL NOT NULL DEFAULT 1.0,
+            confidence_level TEXT NOT NULL DEFAULT 'medium',
+            changed_at TEXT NOT NULL,
+            change_type TEXT NOT NULL CHECK (change_type IN ('update', 'delete'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_history_item_id ON memory_history(item_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_history_version ON memory_history(item_id, version)")
+    return True
+
+
+def _save_history(
+    conn: sqlite3.Connection,
+    item_id: str,
+    old_row: sqlite3.Row,
+    change_type: str = "update"
+) -> None:
+    """Phase 2.6: 将旧版本保存到历史表（在同一事务内）"""
+    # Safely extract confidence_level (sqlite3.Row doesn't have .get() method)
+    try:
+        confidence_level = old_row["confidence_level"]
+    except (KeyError, IndexError):
+        confidence_level = "medium"
+    
+    conn.execute("""
+        INSERT INTO memory_history(
+            item_id, version, content, tags_json, weight, 
+            confidence_level, changed_at, change_type
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        item_id,
+        old_row["version"],
+        old_row["content"],
+        old_row["tags_json"],
+        old_row["weight"],
+        confidence_level,
+        utcnow_iso(),
+        change_type
+    ))
+
+
 def _backfill_content_search(conn: sqlite3.Connection) -> int:
     cur = conn.execute("""
     SELECT id, content FROM memory_items
@@ -482,6 +536,8 @@ class MemoryStore(SemanticSearchMixin):
         _ensure_schema_once(db_path)
         # Initialize connection pool for better performance
         self._pool = SQLiteConnectionPool(db_path)
+        if hasattr(self, "_init_vector_attrs"):
+            self._init_vector_attrs()
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get database connection from pool (thread-safe)"""
@@ -582,6 +638,30 @@ class MemoryStore(SemanticSearchMixin):
             if conn:
                 conn.close()
 
+    def _track_access_batch(self, item_ids: List[str]) -> bool:
+        """批量更新访问记录（不影响主流程）"""
+        if not item_ids:
+            return True
+
+        try:
+            conn = self._get_conn()
+            now = utcnow_iso()
+            placeholders = ",".join("?" * len(item_ids))
+            conn.execute(
+                f"""
+                UPDATE memory_items
+                SET access_count = access_count + 1,
+                    last_accessed_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                [now] + item_ids,
+            )
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.warning("Failed to track access for %s items: %s", len(item_ids), e)
+            return False
+
     def init_db(self) -> Dict[str, Any]:
         return init_db(self._db_path)
 
@@ -670,7 +750,7 @@ class MemoryStore(SemanticSearchMixin):
             content_search = _build_content_search(content)
 
             if item_id:
-                cur = conn.execute("SELECT id, version FROM memory_items WHERE id = ?", (item_id,))
+                cur = conn.execute("SELECT * FROM memory_items WHERE id = ?", (item_id,))
                 row = cur.fetchone()
                 if row is None:
                     raise MemtoolError({
@@ -679,6 +759,9 @@ class MemoryStore(SemanticSearchMixin):
                         "message": f"No memory item found with id: {item_id}",
                         "id": item_id
                     }, 3)
+
+                # Phase 2.6: 保存旧版本到历史
+                _save_history(conn, item_id, row, "update")
 
                 version = int(row["version"]) + 1
                 conn.execute("""
@@ -695,6 +778,12 @@ class MemoryStore(SemanticSearchMixin):
                 existing = find_by_logical_key(conn, type, key, task_id, step_id)
                 if existing:
                     final_id = existing["id"]
+                    
+                    # Phase 2.6: 保存旧版本到历史
+                    old_row = conn.execute("SELECT * FROM memory_items WHERE id = ?", (final_id,)).fetchone()
+                    if old_row:
+                        _save_history(conn, final_id, old_row, "update")
+                    
                     version = int(existing["version"]) + 1
                     conn.execute("""
                     UPDATE memory_items
@@ -991,8 +1080,8 @@ class MemoryStore(SemanticSearchMixin):
                 items.sort(key=lambda x: (x.get("mixed_score", 0.0), x.get("updated_at") or ""), reverse=True)
 
             # Phase 2-1: 追踪访问（对搜索结果）
-            for item in items[:int(limit)]:
-                self._track_access(item["id"])
+            access_ids = [item["id"] for item in items[: int(limit)]]
+            self._track_access_batch(access_ids)
 
             return {"ok": True, "fts5": fts_ok, "items": items[: int(limit)]}
 
@@ -1065,8 +1154,8 @@ class MemoryStore(SemanticSearchMixin):
             )
             
             # Phase 2-1: 追踪访问（对推荐结果）
-            for item in recs:
-                self._track_access(item["id"])
+            access_ids = [item["id"] for item in recs]
+            self._track_access_batch(access_ids)
             
             return {"ok": True, "items": recs, "candidates": len(items), "limit": int(limit)}
         except sqlite3.Error as e:

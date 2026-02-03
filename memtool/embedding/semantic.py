@@ -37,10 +37,12 @@ class SemanticSearchMixin:
         semantic = SemanticSearch(db_path="./memtool.db")
         results = semantic.semantic_search("find errors", limit=10)
     """
-    
-    _vector_store = None
-    _vector_lock = threading.Lock()
-    _vector_initialized = False
+
+    def _init_vector_attrs(self) -> None:
+        """Initialize vector store attributes (instance-scoped)."""
+        self._vector_store: Optional["VectorStore"] = None
+        self._vector_lock = threading.Lock()
+        self._vector_initialized = False
     
     def _get_vector_dir(self) -> Path:
         """Get vector storage directory"""
