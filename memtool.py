@@ -59,11 +59,7 @@ def cmd_put(args: argparse.Namespace) -> None:
             type=args.type,
             key=args.key,
             content=content,
-            task_id=args.task_id,
-            step_id=args.step_id,
             tags=tags,
-            source=args.source,
-            weight=args.weight,
             confidence_level=getattr(args, "confidence", "medium"),
             verified_by=getattr(args, "verified_by", None),
         )
@@ -79,8 +75,6 @@ def cmd_get(args: argparse.Namespace) -> None:
             item_id=args.id,
             type=args.type,
             key=args.key,
-            task_id=args.task_id,
-            step_id=args.step_id,
         )
         emit(result, args.format)
     except MemtoolError as e:
@@ -93,8 +87,6 @@ def cmd_list(args: argparse.Namespace) -> None:
         tags = parse_tags(args.tag)
         result = store.list(
             type=args.type,
-            task_id=args.task_id,
-            step_id=args.step_id,
             key=args.key,
             tags=tags,
             limit=args.limit,
@@ -112,8 +104,6 @@ def cmd_search(args: argparse.Namespace) -> None:
         result = store.search(
             query=args.query,
             type=args.type,
-            task_id=args.task_id,
-            step_id=args.step_id,
             key=args.key,
             limit=args.limit,
             sort_by=getattr(args, "sort_by", "updated"),
@@ -176,7 +166,6 @@ def cmd_recommend(args: argparse.Namespace) -> None:
         result = store.recommend(
             context=args.context,
             type=args.type,
-            task_id=args.task_id,
             tags=tags,
             key_prefix=args.key_prefix,
             limit=args.limit,
@@ -294,11 +283,7 @@ def cmd_template(args: argparse.Namespace) -> None:
             type=tmpl.get("type", "run"),
             key=key,
             content=content,
-            task_id=args.task_id,
-            step_id=args.step_id,
             tags=parse_tags(args.tag),
-            source=args.source,
-            weight=args.weight,
             confidence_level=getattr(args, "confidence", "medium"),
             verified_by=getattr(args, "verified_by", None),
         )
@@ -323,15 +308,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("init", help="初始化数据库")
     s.set_defaults(func=lambda a: emit(init_db(a.db), a.format))
 
+    # put 命令（瘦身后：移除 task-id, step-id, source, weight）
     s = sub.add_parser("put", help="写入或更新一条记忆（id 存在则更新）")
     s.add_argument("--id", help="可选：指定 id；不填则自动生成")
     s.add_argument("--type", required=True, choices=["project","feature","run"])
-    s.add_argument("--task-id")
-    s.add_argument("--step-id")
     s.add_argument("--key", required=True)
     s.add_argument("--tag", action="append", help="可重复；或用逗号分隔，例如 --tag auth,login")
-    s.add_argument("--source", help="来源，例如 PRD/stacktrace/manual")
-    s.add_argument("--weight", default=1.0, help="权重（Router 可用），默认 1.0")
     s.add_argument("--confidence", choices=["high","medium","low"], default="medium", help="置信度：high/medium/low，默认 medium")
     s.add_argument("--verified-by", help="可选：验证来源，例如 code_review#123")
     g = s.add_mutually_exclusive_group()
@@ -339,18 +321,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--file", help="从文件读取 content；不填则从 stdin 读取")
     s.set_defaults(func=cmd_put)
 
-    s = sub.add_parser("get", help="按 id 获取，或按 (type,key,task_id,step_id) 获取最新一条")
+    # get 命令（瘦身后：移除 task-id, step-id）
+    s = sub.add_parser("get", help="按 id 获取，或按 (type, key) 获取最新一条")
     s.add_argument("--id")
     s.add_argument("--type", choices=["project","feature","run"])
     s.add_argument("--key")
-    s.add_argument("--task-id")
-    s.add_argument("--step-id")
     s.set_defaults(func=cmd_get)
 
+    # list 命令（瘦身后：移除 task-id, step-id）
     s = sub.add_parser("list", help="列表查询（默认按 updated_at 倒序）")
     s.add_argument("--type", choices=["project","feature","run"])
-    s.add_argument("--task-id")
-    s.add_argument("--step-id")
     s.add_argument("--key")
     s.add_argument("--tag", action="append")
     s.add_argument("--limit", default=50)
@@ -358,11 +338,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--exclude-stale", action="store_true", help="过滤掉衰减后的旧记忆")
     s.set_defaults(func=cmd_list)
 
+    # search 命令（瘦身后：移除 task-id, step-id）
     s = sub.add_parser("search", help="全文检索（FTS5 优先，自动降级 LIKE）")
     s.add_argument("--query", required=True)
     s.add_argument("--type", choices=["project","feature","run"])
-    s.add_argument("--task-id")
-    s.add_argument("--step-id")
     s.add_argument("--key")
     s.add_argument("--limit", default=20)
     s.add_argument("--sort-by", choices=["updated","confidence","recency","mixed"], default="updated")
@@ -381,10 +360,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--input", required=True)
     s.set_defaults(func=cmd_import)
 
+    # recommend 命令（瘦身后：移除 task-id）
     s = sub.add_parser("recommend", help="基于上下文推荐相关记忆")
     s.add_argument("--context", help="当前上下文或问题描述")
     s.add_argument("--type", choices=["project","feature","run"])
-    s.add_argument("--task-id")
     s.add_argument("--tag", action="append")
     s.add_argument("--key-prefix")
     s.add_argument("--limit", default=10)

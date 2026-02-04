@@ -34,6 +34,40 @@ _SCHEMA_READY: set[str] = set()
 _MIN_TOKEN_LEN = 2
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# 瘦身重构：字段分类
+# =============================================================================
+
+# 核心字段（保留，返回给用户）
+CORE_FIELDS = [
+    'id', 'type', 'key', 'content', 'tags',
+    'created_at', 'updated_at', 'version',
+    'access_count', 'last_accessed_at',
+    'confidence_level', 'verified_by'
+]
+
+# 废弃字段（仍存在于数据库，但代码层忽略）
+DEPRECATED_FIELDS = [
+    'task_id', 'step_id', 'source', 'weight',
+    'context_tags', 'emotional_valence', 'urgency_level',
+    'consolidation_score', 'decay_score', 'is_stale',
+    'related', 'session_id'
+]
+
+# 废弃字段的默认值（用于 put 时保证数据库兼容）
+DEPRECATED_DEFAULTS = {
+    'task_id': None,
+    'step_id': None,
+    'source': None,
+    'weight': 1.0,
+    'context_tags_json': '[]',
+    'emotional_valence': 0.0,
+    'urgency_level': 0,
+    'consolidation_score': 0.0,
+    'related_json': '[]',
+    'session_id': None,
+}
+
 
 class MemtoolError(Exception):
     def __init__(self, payload: Dict[str, Any], exit_code: int) -> None:
@@ -492,23 +526,29 @@ def find_by_logical_key(conn: sqlite3.Connection, type_: str, key: str,
     return conn.execute(sql, tuple(params)).fetchone()
 
 
-def _row_to_obj(r: sqlite3.Row) -> Dict[str, Any]:
+def _row_to_obj(r: sqlite3.Row, include_deprecated: bool = False) -> Dict[str, Any]:
+    """将数据库行转换为字典对象
+    
+    Args:
+        r: sqlite3.Row 对象
+        include_deprecated: 是否包含废弃字段（用于内部操作，默认 False）
+    
+    Returns:
+        只包含核心字段的字典（瘦身后），或全部字段（如果 include_deprecated=True）
+    """
+    # 核心字段（总是返回）
     obj = {
         "id": r["id"],
         "type": r["type"],
-        "task_id": r["task_id"],
-        "step_id": r["step_id"],
         "key": r["key"],
         "content": r["content"],
         "tags": json.loads(r["tags_json"] or "[]"),
-        "source": r["source"],
-        "weight": r["weight"],
         "version": r["version"],
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
     }
 
-    # 安全地添加可选字段
+    # 安全地添加可选核心字段
     try:
         obj["confidence_level"] = r["confidence_level"]
     except (KeyError, IndexError):
@@ -519,7 +559,7 @@ def _row_to_obj(r: sqlite3.Row) -> Dict[str, Any]:
     except (KeyError, IndexError):
         obj["verified_by"] = None
 
-    # Phase 2-1: 添加记忆巩固字段
+    # 访问追踪字段（核心字段）
     try:
         obj["access_count"] = r["access_count"]
     except (KeyError, IndexError):
@@ -530,35 +570,42 @@ def _row_to_obj(r: sqlite3.Row) -> Dict[str, Any]:
     except (KeyError, IndexError):
         obj["last_accessed_at"] = None
 
-    try:
-        obj["consolidation_score"] = r["consolidation_score"]
-    except (KeyError, IndexError):
-        obj["consolidation_score"] = 0.0
+    # 如果需要废弃字段（仅用于内部操作）
+    if include_deprecated:
+        obj["task_id"] = r["task_id"]
+        obj["step_id"] = r["step_id"]
+        obj["source"] = r["source"]
+        obj["weight"] = r["weight"]
+        
+        try:
+            obj["consolidation_score"] = r["consolidation_score"]
+        except (KeyError, IndexError):
+            obj["consolidation_score"] = 0.0
 
-    try:
-        obj["context_tags"] = json.loads(r["context_tags_json"] or "[]")
-    except (KeyError, IndexError, TypeError):
-        obj["context_tags"] = []
+        try:
+            obj["context_tags"] = json.loads(r["context_tags_json"] or "[]")
+        except (KeyError, IndexError, TypeError):
+            obj["context_tags"] = []
 
-    try:
-        obj["emotional_valence"] = r["emotional_valence"]
-    except (KeyError, IndexError):
-        obj["emotional_valence"] = 0.0
+        try:
+            obj["emotional_valence"] = r["emotional_valence"]
+        except (KeyError, IndexError):
+            obj["emotional_valence"] = 0.0
 
-    try:
-        obj["urgency_level"] = r["urgency_level"]
-    except (KeyError, IndexError):
-        obj["urgency_level"] = 0
+        try:
+            obj["urgency_level"] = r["urgency_level"]
+        except (KeyError, IndexError):
+            obj["urgency_level"] = 0
 
-    try:
-        obj["related"] = json.loads(r["related_json"] or "[]")
-    except (KeyError, IndexError, TypeError):
-        obj["related"] = []
+        try:
+            obj["related"] = json.loads(r["related_json"] or "[]")
+        except (KeyError, IndexError, TypeError):
+            obj["related"] = []
 
-    try:
-        obj["session_id"] = r["session_id"]
-    except (KeyError, IndexError):
-        obj["session_id"] = None
+        try:
+            obj["session_id"] = r["session_id"]
+        except (KeyError, IndexError):
+            obj["session_id"] = None
 
     return obj
 
@@ -803,28 +850,47 @@ class MemoryStore(SemanticSearchMixin):
         type: str,
         key: str,
         content: str,
-        task_id: Optional[str] = None,
-        step_id: Optional[str] = None,
         tags: Optional[List[str]] = None,
-        source: Optional[str] = None,
-        weight: float = 1.0,
         confidence_level: str = "medium",
         verified_by: Optional[str] = None,
+        # 废弃字段（保留参数兼容性，但使用默认值）
+        task_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        source: Optional[str] = None,
+        weight: float = 1.0,
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """存储或更新记忆
+        
+        核心参数：
+            item_id: 可选，指定 id 更新
+            type: 记忆类型 (project/feature/run)
+            key: 唯一标识
+            content: 记忆内容
+            tags: 可选标签列表
+            confidence_level: 置信度 (low/medium/high)
+            verified_by: 验证来源
+        
+        废弃参数（仍接受但使用默认值存储）：
+            task_id, step_id, source, weight, session_id
+        """
         conn: Optional[sqlite3.Connection] = None
         try:
             conn = self._get_conn()
             now = utcnow_iso()
             tags_json = json.dumps(tags or [], ensure_ascii=False)
-            weight_value = _coerce_weight(weight)
             content_search = _build_content_search(content)
-            from memtool.context.extractor import ContextExtractor
-            context_tags, emotional_valence, urgency_level = ContextExtractor.extract(
-                content=content,
-                metadata={"type": type, "task_id": task_id, "step_id": step_id},
-            )
-            context_tags_json = json.dumps(context_tags, ensure_ascii=False)
+            
+            # 废弃字段使用默认值（保证数据库兼容性）
+            weight_value = DEPRECATED_DEFAULTS['weight']
+            context_tags_json = DEPRECATED_DEFAULTS['context_tags_json']
+            emotional_valence = DEPRECATED_DEFAULTS['emotional_valence']
+            urgency_level = DEPRECATED_DEFAULTS['urgency_level']
+            related_json = DEPRECATED_DEFAULTS['related_json']
+            task_id_value = DEPRECATED_DEFAULTS['task_id']
+            step_id_value = DEPRECATED_DEFAULTS['step_id']
+            source_value = DEPRECATED_DEFAULTS['source']
+            session_id_value = DEPRECATED_DEFAULTS['session_id']
 
             if item_id:
                 cur = conn.execute("SELECT * FROM memory_items WHERE id = ?", (item_id,))
@@ -841,10 +907,11 @@ class MemoryStore(SemanticSearchMixin):
                 _save_history(conn, item_id, row, "update")
 
                 version = int(row["version"]) + 1
+                # 保留现有的废弃字段值（更新时不改变）
                 try:
                     related_json = row["related_json"] or "[]"
                 except (KeyError, IndexError):
-                    related_json = "[]"
+                    pass
                 conn.execute("""
                 UPDATE memory_items
                 SET type=?, task_id=?, step_id=?, key=?, content=?, content_search=?, tags_json=?,
@@ -852,14 +919,15 @@ class MemoryStore(SemanticSearchMixin):
                     source=?, weight=?, version=?, updated_at=?, confidence_level=?, verified_by=?
                 WHERE id=?
                 """, (
-                    type, task_id, step_id, key, content, content_search,
-                    tags_json, context_tags_json, emotional_valence, urgency_level, related_json, session_id,
-                    source, weight_value, version, now, confidence_level, verified_by, item_id
+                    type, task_id_value, step_id_value, key, content, content_search,
+                    tags_json, context_tags_json, emotional_valence, urgency_level, related_json, session_id_value,
+                    source_value, weight_value, version, now, confidence_level, verified_by, item_id
                 ))
                 action = "updated"
                 final_id = item_id
             else:
-                existing = find_by_logical_key(conn, type, key, task_id, step_id)
+                # 瘦身后：按 (type, key) 查找，忽略 task_id/step_id
+                existing = find_by_logical_key(conn, type, key, None, None)
                 if existing:
                     final_id = existing["id"]
                     
@@ -872,7 +940,7 @@ class MemoryStore(SemanticSearchMixin):
                     try:
                         related_json = old_row["related_json"] or "[]"
                     except (KeyError, IndexError, TypeError):
-                        related_json = "[]"
+                        pass
                     conn.execute("""
                     UPDATE memory_items
                     SET type=?, task_id=?, step_id=?, key=?, content=?, content_search=?, tags_json=?,
@@ -880,9 +948,9 @@ class MemoryStore(SemanticSearchMixin):
                         source=?, weight=?, version=?, updated_at=?, confidence_level=?, verified_by=?
                     WHERE id=?
                     """, (
-                        type, task_id, step_id, key, content, content_search,
-                        tags_json, context_tags_json, emotional_valence, urgency_level, related_json, session_id,
-                        source, weight_value, version, now, confidence_level, verified_by, final_id
+                        type, task_id_value, step_id_value, key, content, content_search,
+                        tags_json, context_tags_json, emotional_valence, urgency_level, related_json, session_id_value,
+                        source_value, weight_value, version, now, confidence_level, verified_by, final_id
                     ))
                     action = "updated"
                 else:
@@ -896,9 +964,9 @@ class MemoryStore(SemanticSearchMixin):
                     )
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (
-                        final_id, type, task_id, step_id, key, content, content_search,
-                        tags_json, context_tags_json, emotional_valence, urgency_level, "[]", session_id,
-                        source, weight_value, version, now, now, confidence_level, verified_by
+                        final_id, type, task_id_value, step_id_value, key, content, content_search,
+                        tags_json, context_tags_json, emotional_valence, urgency_level, "[]", session_id_value,
+                        source_value, weight_value, version, now, now, confidence_level, verified_by
                     ))
                     action = "inserted"
 
@@ -913,10 +981,7 @@ class MemoryStore(SemanticSearchMixin):
                         "content": content,
                         "type": type,
                         "key": key,
-                        "task_id": task_id,
-                        "step_id": step_id,
                         "tags": tags or [],
-                        "weight": weight_value,
                         "confidence_level": confidence_level,
                         "updated_at": now,
                     })
@@ -952,9 +1017,20 @@ class MemoryStore(SemanticSearchMixin):
         item_id: Optional[str] = None,
         type: Optional[str] = None,
         key: Optional[str] = None,
+        # 废弃参数（保留兼容性，但忽略）
         task_id: Optional[str] = None,
         step_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """获取记忆
+        
+        核心参数：
+            item_id: 按 ID 获取
+            type: 记忆类型
+            key: 唯一标识
+        
+        废弃参数（忽略）：
+            task_id, step_id
+        """
         conn: Optional[sqlite3.Connection] = None
         try:
             conn = self._get_conn()
@@ -966,18 +1042,9 @@ class MemoryStore(SemanticSearchMixin):
                 self._track_access(item_id)
                 return _row_to_obj(row)
 
+            # 瘦身后：按 (type, key) 查找，忽略 task_id/step_id
             where = ["type = ?", "key = ?"]
             params: List[Any] = [type, key]
-            if task_id is not None:
-                where.append("task_id = ?")
-                params.append(task_id)
-            else:
-                where.append("task_id IS NULL")
-            if step_id is not None:
-                where.append("step_id = ?")
-                params.append(step_id)
-            else:
-                where.append("step_id IS NULL")
 
             sql = f"SELECT * FROM memory_items WHERE {' AND '.join(where)} ORDER BY updated_at DESC LIMIT 1"
             row = conn.execute(sql, tuple(params)).fetchone()
@@ -985,7 +1052,7 @@ class MemoryStore(SemanticSearchMixin):
                 raise MemtoolError({
                     "ok": False,
                     "error": "NOT_FOUND",
-                    "query": {"type": type, "key": key, "task_id": task_id, "step_id": step_id}
+                    "query": {"type": type, "key": key}
                 }, 3)
             # Phase 2-1: 追踪访问
             self._track_access(row["id"])
@@ -1000,8 +1067,6 @@ class MemoryStore(SemanticSearchMixin):
         self,
         *,
         type: Optional[str] = None,
-        task_id: Optional[str] = None,
-        step_id: Optional[str] = None,
         key: Optional[str] = None,
         tags: Optional[List[str]] = None,
         limit: int = 50,
@@ -1009,7 +1074,22 @@ class MemoryStore(SemanticSearchMixin):
         sort_by: str = "updated",
         include_stale: bool = True,
         stale_threshold: float = DEFAULT_STALE_THRESHOLD,
+        # 废弃参数（保留兼容性，但忽略）
+        task_id: Optional[str] = None,
+        step_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        """列出记忆
+        
+        核心参数：
+            type: 记忆类型
+            key: 唯一标识
+            tags: 标签过滤
+            limit, offset: 分页
+            sort_by: 排序方式
+        
+        废弃参数（忽略）：
+            task_id, step_id
+        """
         conn: Optional[sqlite3.Connection] = None
         try:
             conn = self._get_conn()
@@ -1018,12 +1098,7 @@ class MemoryStore(SemanticSearchMixin):
             if type:
                 where.append("type = ?")
                 params.append(type)
-            if task_id is not None:
-                where.append("task_id = ?")
-                params.append(task_id)
-            if step_id is not None:
-                where.append("step_id = ?")
-                params.append(step_id)
+            # 瘦身后：移除 task_id/step_id 过滤
             if key:
                 where.append("key = ?")
                 params.append(key)
@@ -1088,14 +1163,26 @@ class MemoryStore(SemanticSearchMixin):
         *,
         query: str,
         type: Optional[str] = None,
-        task_id: Optional[str] = None,
-        step_id: Optional[str] = None,
         key: Optional[str] = None,
         limit: int = 20,
         sort_by: str = "updated",
         include_stale: bool = True,
         stale_threshold: float = DEFAULT_STALE_THRESHOLD,
+        # 废弃参数（保留兼容性，但忽略）
+        task_id: Optional[str] = None,
+        step_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """搜索记忆
+        
+        核心参数：
+            query: 搜索关键词
+            type: 记忆类型
+            key: 唯一标识
+            limit: 返回数量限制
+        
+        废弃参数（忽略）：
+            task_id, step_id
+        """
         q = query.strip()
         if not q:
             raise MemtoolError({"ok": False, "error": "PARAM_ERROR", "message": "Query string cannot be empty"}, 2)
@@ -1114,12 +1201,7 @@ class MemoryStore(SemanticSearchMixin):
             if type:
                 where.append("m.type = ?")
                 params.append(type)
-            if task_id is not None:
-                where.append("m.task_id = ?")
-                params.append(task_id)
-            if step_id is not None:
-                where.append("m.step_id = ?")
-                params.append(step_id)
+            # 瘦身后：移除 task_id/step_id 过滤
             if key:
                 where.append("m.key = ?")
                 params.append(key)

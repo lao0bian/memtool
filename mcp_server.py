@@ -68,6 +68,8 @@ def assess_knowledge(
     """Phase 2-1: 评估 Agent 对某个主题的记忆可信度（元认知）
     
     独立函数版本，可供测试和其他模块使用
+    
+    瘦身后简化版本：只依赖核心字段
     """
     if not topic or not str(topic).strip():
         return _param_error("topic cannot be empty")
@@ -99,12 +101,11 @@ def assess_knowledge(
                     "total_memories": 0,
                     "avg_confidence": 0.0,
                     "avg_recency": 0.0,
-                    "avg_consolidation": 0.0,
                     "coverage": 0.0
                 }
             }
         
-        # 计算元认知分数
+        # 计算元认知分数（简化版本：只用核心字段）
         from memtool_rank import score_item
         import datetime as dt
         now = dt.datetime.now(tz=dt.timezone.utc)
@@ -117,14 +118,17 @@ def assess_knowledge(
         avg_confidence = sum(item.get("confidence_score", 0.6) for item in items) / len(items)
         coverage = min(len(items) / 10.0, 1.0)  # 10 条记忆 = 完整覆盖
         avg_recency = sum(item.get("recency_score", 0.5) for item in items) / len(items)
-        avg_consolidation = sum(item.get("consolidation_score", 0.0) for item in items) / len(items)
         
-        # 综合元认知分数
+        # 简化后的元认知分数（不再依赖 consolidation_score）
+        # 使用 access_count 作为替代指标
+        total_access = sum(item.get("access_count", 0) for item in items)
+        access_factor = min(total_access / 50.0, 1.0)  # 50 次访问 = 完整
+        
         meta_score = (
-            avg_confidence * 0.35 +
-            coverage * 0.25 +
+            avg_confidence * 0.40 +
+            coverage * 0.30 +
             avg_recency * 0.20 +
-            avg_consolidation * 0.20
+            access_factor * 0.10
         )
         
         # 分级评估
@@ -155,7 +159,7 @@ def assess_knowledge(
                 "获取新信息后更新记忆库"
             ]
         
-        # 提取高质量证据
+        # 提取高质量证据（只返回核心字段）
         evidence = sorted(items, key=lambda x: x.get("confidence_score", 0), reverse=True)[:5]
         
         return {
@@ -166,13 +170,12 @@ def assess_knowledge(
             "suggestions": suggestions,
             "evidence": [
                 {
-                    "id": e["id"],
-                    "key": e["key"],
+                    "id": e.get("id"),
+                    "key": e.get("key"),
                     "confidence_level": e.get("confidence_level"),
                     "access_count": e.get("access_count", 0),
-                    "consolidation_score": round(e.get("consolidation_score", 0.0), 3),
                     "updated_at": e.get("updated_at"),
-                    "snippet": e.get("content", "")[:100] + "..."
+                    "snippet": (e.get("content") or "")[:100] + "..."
                 }
                 for e in evidence
             ],
@@ -180,7 +183,7 @@ def assess_knowledge(
                 "total_memories": len(items),
                 "avg_confidence": round(avg_confidence, 3),
                 "avg_recency": round(avg_recency, 3),
-                "avg_consolidation": round(avg_consolidation, 3),
+                "total_access": total_access,
                 "coverage": round(coverage, 3)
             }
         }
@@ -375,16 +378,32 @@ if FastMCP is not None:
         type: str,
         key: str,
         content: Any,
+        tags: Optional[Any] = None,
+        confidence_level: str = "medium",
+        verified_by: Optional[str] = None,
         item_id: Optional[str] = None,
+        db_path: Optional[str] = None,
+        # 废弃参数（保留兼容性，但忽略）
         task_id: Optional[str] = None,
         step_id: Optional[str] = None,
-        tags: Optional[Any] = None,
         source: Optional[str] = None,
         weight: float = 1.0,
         session_id: Optional[str] = None,
-        db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Store or update memory (upsert by id or logical key)."""
+        """Store or update memory (upsert by id or logical key).
+        
+        Args:
+            type: Memory type (project/feature/run)
+            key: Unique identifier
+            content: Memory content
+            tags: Optional tags
+            confidence_level: Confidence level (low/medium/high)
+            verified_by: Optional verification source
+            item_id: Optional id for update
+        
+        Deprecated (ignored):
+            task_id, step_id, source, weight, session_id
+        """
         if not type or not key:
             return _param_error("type and key are required")
         if type not in _VALID_TYPES:
@@ -393,10 +412,6 @@ if FastMCP is not None:
             return _param_error("content is required")
         if tags is not None and not isinstance(tags, (str, list)):
             return _param_error("tags must be a string or list")
-        try:
-            weight_value = float(weight)
-        except (TypeError, ValueError):
-            return _param_error("weight must be a number")
         try:
             content_value = _coerce_content(content)
         except (TypeError, ValueError):
@@ -410,12 +425,9 @@ if FastMCP is not None:
                     type=type,
                     key=key,
                     content=content_value,
-                    task_id=task_id,
-                    step_id=step_id,
                     tags=_normalize_tags(tags),
-                    source=source,
-                    weight=weight_value,
-                    session_id=session_id,
+                    confidence_level=confidence_level,
+                    verified_by=verified_by,
                 )
         except MemtoolError as e:
             return e.payload
@@ -427,11 +439,21 @@ if FastMCP is not None:
         item_id: Optional[str] = None,
         type: Optional[str] = None,
         key: Optional[str] = None,
+        db_path: Optional[str] = None,
+        # 废弃参数（保留兼容性，但忽略）
         task_id: Optional[str] = None,
         step_id: Optional[str] = None,
-        db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Recall a memory by id or logical key (type+key, optional task/step)."""
+        """Recall a memory by id or logical key (type+key).
+        
+        Args:
+            item_id: Get by id
+            type: Memory type
+            key: Unique identifier
+        
+        Deprecated (ignored):
+            task_id, step_id
+        """
         if not item_id and (not type or not key):
             return _param_error("item_id or (type + key) is required")
         if type is not None and type not in _VALID_TYPES:
@@ -443,8 +465,6 @@ if FastMCP is not None:
                 item_id=item_id,
                 type=type,
                 key=key,
-                task_id=task_id,
-                step_id=step_id,
             )
         except MemtoolError as e:
             return e.payload
@@ -455,15 +475,26 @@ if FastMCP is not None:
     def memory_search(
         query: str,
         type: Optional[str] = None,
-        task_id: Optional[str] = None,
-        step_id: Optional[str] = None,
         key: Optional[str] = None,
         limit: int = 20,
         sort_by: str = "updated",
         include_stale: bool = True,
         db_path: Optional[str] = None,
+        # 废弃参数（保留兼容性，但忽略）
+        task_id: Optional[str] = None,
+        step_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Full-text search (FTS5 if available, else LIKE)."""
+        """Full-text search (FTS5 if available, else LIKE).
+        
+        Args:
+            query: Search query
+            type: Memory type filter
+            key: Key filter
+            limit: Max results
+        
+        Deprecated (ignored):
+            task_id, step_id
+        """
         if not query or not str(query).strip():
             return _param_error("query cannot be empty")
         if type is not None and type not in _VALID_TYPES:
@@ -480,8 +511,6 @@ if FastMCP is not None:
             return store.search(
                 query=str(query),
                 type=type,
-                task_id=task_id,
-                step_id=step_id,
                 key=key,
                 limit=limit_value,
                 sort_by=sort_by,
@@ -530,8 +559,6 @@ if FastMCP is not None:
     @mcp.tool()
     def memory_list(
         type: Optional[str] = None,
-        task_id: Optional[str] = None,
-        step_id: Optional[str] = None,
         key: Optional[str] = None,
         tags: Optional[Any] = None,
         limit: int = 50,
@@ -539,8 +566,21 @@ if FastMCP is not None:
         sort_by: str = "updated",
         include_stale: bool = True,
         db_path: Optional[str] = None,
+        # 废弃参数（保留兼容性，但忽略）
+        task_id: Optional[str] = None,
+        step_id: Optional[str] = None,
     ) -> Any:
-        """List memories with optional filters."""
+        """List memories with optional filters.
+        
+        Args:
+            type: Memory type filter
+            key: Key filter
+            tags: Tags filter
+            limit, offset: Pagination
+        
+        Deprecated (ignored):
+            task_id, step_id
+        """
         if type is not None and type not in _VALID_TYPES:
             return _param_error("type must be one of: project, feature, run")
         if tags is not None and not isinstance(tags, (str, list)):
@@ -559,8 +599,6 @@ if FastMCP is not None:
             store = _store_for(db_path)
             rows = store.list(
                 type=type,
-                task_id=task_id,
-                step_id=step_id,
                 key=key,
                 tags=_normalize_tags(tags),
                 limit=limit_value,
@@ -578,14 +616,26 @@ if FastMCP is not None:
     def memory_recommend(
         context: Optional[str] = None,
         type: Optional[str] = None,
-        task_id: Optional[str] = None,
         tags: Optional[Any] = None,
         key_prefix: Optional[str] = None,
         limit: int = 10,
         include_stale: bool = False,
         db_path: Optional[str] = None,
+        # 废弃参数（保留兼容性，但忽略）
+        task_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Recommend related memories based on context/task."""
+        """Recommend related memories based on context.
+        
+        Args:
+            context: Current context or question
+            type: Memory type filter
+            tags: Tags filter
+            key_prefix: Key prefix filter
+            limit: Max results
+        
+        Deprecated (ignored):
+            task_id
+        """
         if type is not None and type not in _VALID_TYPES:
             return _param_error("type must be one of: project, feature, run")
         try:
@@ -600,7 +650,6 @@ if FastMCP is not None:
             return store.recommend(
                 context=context,
                 type=type,
-                task_id=task_id,
                 tags=_normalize_tags(tags),
                 key_prefix=key_prefix,
                 limit=limit_value,

@@ -39,7 +39,7 @@ class TestPhase2_1(unittest.TestCase):
         conn.close()
 
     def test_new_fields_have_defaults(self):
-        """测试新字段有正确的默认值"""
+        """测试新字段有正确的默认值（瘦身后只验证核心字段）"""
         result = self.store.put(
             item_id=None,
             type="feature",
@@ -53,10 +53,11 @@ class TestPhase2_1(unittest.TestCase):
         # 获取记录
         item = self.store.get(item_id=item_id)
         
-        # 验证默认值
+        # 验证核心字段默认值
         self.assertEqual(item["access_count"], 0)
         self.assertIsNone(item["last_accessed_at"])
-        self.assertEqual(item["consolidation_score"], 0.0)
+        # 瘦身后：consolidation_score 是废弃字段，不再返回
+        self.assertNotIn("consolidation_score", item)
 
     def test_access_tracking_on_get(self):
         """测试 get() 触发访问追踪"""
@@ -110,7 +111,7 @@ class TestPhase2_1(unittest.TestCase):
             self.assertGreaterEqual(item["access_count"], 1)  # 至少被 search 访问了一次
 
     def test_consolidation_score_calculation(self):
-        """测试巩固分数计算"""
+        """测试巩固分数计算（瘦身后：巩固分数是内部字段，不对外返回）"""
         # 创建一个记录
         result = self.store.put(
             item_id=None,
@@ -127,12 +128,8 @@ class TestPhase2_1(unittest.TestCase):
         # 获取最新数据
         item = self.store.get(item_id=item_id)
         
-        # 验证巩固分数增加
-        self.assertGreater(item["consolidation_score"], 0.0)
-        self.assertLessEqual(item["consolidation_score"], 1.0)
-        
-        # 访问越多，巩固分数应该越高（对数增长）
-        # 由于访问追踪是异步的，access_count 应该 >= 10
+        # 瘦身后：consolidation_score 不再返回给用户
+        # 但 access_count 作为核心字段仍然可用
         self.assertGreaterEqual(item["access_count"], 10)
 
     def test_consolidation_affects_decay(self):
@@ -260,7 +257,6 @@ class TestMetacognition(unittest.TestCase):
             print(f"  信心: {result['confidence']}")
             print(f"  分数: {result['score']:.4f}")
             print(f"  记忆数: {result['stats']['total_memories']}")
-            print(f"  平均巩固: {result['stats']['avg_consolidation']:.3f}")
 
     def test_assess_knowledge_quality_levels(self):
         """测试不同质量记忆的元认知评估"""
@@ -364,14 +360,14 @@ class TestBackwardCompatibility(unittest.TestCase):
         item = store.get(item_id="old_id")
         self.assertEqual(item["key"], "old_key")
         
-        # 验证 Phase 2-1 新字段存在且有默认值
+        # 验证核心字段存在且有默认值
         self.assertIn("access_count", item)
         self.assertEqual(item["access_count"], 0)  # 默认值
         
         self.assertIn("last_accessed_at", item)
         
-        self.assertIn("consolidation_score", item)
-        self.assertEqual(item["consolidation_score"], 0.0)  # 默认值
+        # 瘦身后：consolidation_score 是废弃字段，不再返回
+        self.assertNotIn("consolidation_score", item)
 
 
 if __name__ == "__main__":
