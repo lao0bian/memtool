@@ -65,33 +65,40 @@ def assess_knowledge(
     topic: str,
     db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Phase 2-1: 评估 Agent 对某个主题的记忆可信度（元认知）
-    
+    """Phase 2.7: 评估 Agent 对某个主题的记忆可信度（元认知）
+
     独立函数版本，可供测试和其他模块使用
-    
-    瘦身后简化版本：只依赖核心字段
+
+    增强版本：4 维度 breakdown + bottleneck 识别 + 针对性建议
     """
     if not topic or not str(topic).strip():
         return _param_error("topic cannot be empty")
-    
+
     try:
         store = _store_for(db_path)
-        
+
         # 搜索相关记忆（使用 hybrid 搜索更准确）
         try:
             results = store.hybrid_search(query=str(topic), limit=50)
         except Exception:
             # Fallback to regular search if hybrid not available
             results = store.search(query=str(topic), limit=50)
-        
+
         items = results.get("items", [])
-        
+
         if not items:
             return {
                 "ok": True,
                 "confidence": "none",
                 "score": 0.0,
                 "message": f"我对「{topic}」没有记忆",
+                "breakdown": {
+                    "quantity_score": 0.0,
+                    "quality_score": 0.0,
+                    "recency_score": 0.0,
+                    "access_score": 0.0,
+                },
+                "issues": ["no_data"],
                 "suggestions": [
                     "建议通过 web_search 或查阅文档获取信息",
                     "获取信息后用 memory_store 记录"
@@ -104,69 +111,82 @@ def assess_knowledge(
                     "coverage": 0.0
                 }
             }
-        
-        # 计算元认知分数（简化版本：只用核心字段）
+
+        # Phase 2.7: 使用 metacognition 模块计算细粒度评估
+        from memtool.metacognition import (
+            compute_breakdown,
+            identify_issues,
+            generate_suggestions,
+            find_bottleneck,
+        )
         from memtool_rank import score_item
         import datetime as dt
         now = dt.datetime.now(tz=dt.timezone.utc)
-        
+
         # 为每个 item 计算分数（如果还没有）
         for item in items:
             if "confidence_score" not in item:
                 item.update(score_item(item, now=now))
-        
-        avg_confidence = sum(item.get("confidence_score", 0.6) for item in items) / len(items)
-        coverage = min(len(items) / 10.0, 1.0)  # 10 条记忆 = 完整覆盖
-        avg_recency = sum(item.get("recency_score", 0.5) for item in items) / len(items)
-        
-        # 简化后的元认知分数（不再依赖 consolidation_score）
-        # 使用 access_count 作为替代指标
-        total_access = sum(item.get("access_count", 0) for item in items)
-        access_factor = min(total_access / 50.0, 1.0)  # 50 次访问 = 完整
-        
+
+        # 计算 4 维度 breakdown
+        breakdown = compute_breakdown(items, now=now)
+
+        # 识别问题
+        issues = identify_issues(breakdown)
+
+        # 生成针对性建议
+        suggestions = generate_suggestions(topic, breakdown, issues, items)
+
+        # 找出最薄弱维度
+        bottleneck = find_bottleneck(breakdown)
+
+        # 计算综合元认知分数（使用 breakdown 加权）
         meta_score = (
-            avg_confidence * 0.40 +
-            coverage * 0.30 +
-            avg_recency * 0.20 +
-            access_factor * 0.10
+            breakdown["quality_score"] * 0.35 +
+            breakdown["quantity_score"] * 0.25 +
+            breakdown["recency_score"] * 0.25 +
+            breakdown["access_score"] * 0.15
         )
-        
+
         # 分级评估
         if meta_score >= 0.8:
             level = "high"
             message = f"我对「{topic}」很有把握，有 {len(items)} 条相关记忆"
-            suggestions = ["可以直接使用这些记忆回答问题"]
         elif meta_score >= 0.5:
             level = "medium"
-            message = f"我对「{topic}」有一些了解，但不完全确定"
-            suggestions = [
-                "建议交叉验证这些记忆",
-                "如果是关键决策，最好查询最新资料"
-            ]
+            # 根据 bottleneck 生成更具体的消息
+            if bottleneck == "recency_score":
+                message = f"我对「{topic}」有一些了解，但相关记忆较久远"
+            elif bottleneck == "quantity_score":
+                message = f"我对「{topic}」有一些了解，但记录较少"
+            elif bottleneck == "quality_score":
+                message = f"我对「{topic}」有一些了解，但置信度不高"
+            else:
+                message = f"我对「{topic}」有一些了解，但不完全确定"
         elif meta_score >= 0.2:
             level = "low"
             message = f"我对「{topic}」的记忆比较模糊"
-            suggestions = [
-                "记忆可能过时或不完整",
-                "建议重新学习或查询外部资源",
-                f"找到 {len(items)} 条记忆但质量较低"
-            ]
         else:
             level = "very_low"
             message = f"我对「{topic}」几乎没有可靠记忆"
-            suggestions = [
-                "强烈建议查询外部资源",
-                "获取新信息后更新记忆库"
-            ]
-        
+
         # 提取高质量证据（只返回核心字段）
         evidence = sorted(items, key=lambda x: x.get("confidence_score", 0), reverse=True)[:5]
-        
+
+        # 计算统计数据
+        avg_confidence = sum(item.get("confidence_score", 0.6) for item in items) / len(items)
+        avg_recency = breakdown["recency_score"]
+        total_access = sum(item.get("access_count", 0) for item in items)
+        coverage = breakdown["quantity_score"]
+
         return {
             "ok": True,
             "confidence": level,
             "score": round(meta_score, 4),
             "message": message,
+            "breakdown": breakdown,
+            "issues": issues,
+            "bottleneck": bottleneck,
             "suggestions": suggestions,
             "evidence": [
                 {
