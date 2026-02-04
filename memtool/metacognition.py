@@ -17,12 +17,29 @@ from typing import Any, Dict, List, Optional
 
 from memtool_lifecycle import decay_score
 
-# 可配置阈值（支持环境变量覆盖）
-QUANTITY_THRESHOLD = int(os.environ.get("MEMTOOL_QUANTITY_THRESHOLD", "10"))
-RECENCY_STALE_THRESHOLD = float(os.environ.get("MEMTOOL_RECENCY_STALE_THRESHOLD", "0.4"))
-QUALITY_LOW_THRESHOLD = float(os.environ.get("MEMTOOL_QUALITY_LOW_THRESHOLD", "0.5"))
-ACCESS_LOW_THRESHOLD = float(os.environ.get("MEMTOOL_ACCESS_LOW_THRESHOLD", "0.2"))
-QUANTITY_LOW_THRESHOLD = float(os.environ.get("MEMTOOL_QUANTITY_LOW_THRESHOLD", "0.3"))
+# 安全的环境变量解析函数
+def _safe_env_int(key: str, default: int) -> int:
+    """安全解析整数环境变量，解析失败时返回默认值"""
+    try:
+        return int(os.environ.get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_env_float(key: str, default: float) -> float:
+    """安全解析浮点数环境变量，解析失败时返回默认值"""
+    try:
+        return float(os.environ.get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
+# 可配置阈值（支持环境变量覆盖，解析失败时使用默认值）
+QUANTITY_THRESHOLD = _safe_env_int("MEMTOOL_QUANTITY_THRESHOLD", 10)
+RECENCY_STALE_THRESHOLD = _safe_env_float("MEMTOOL_RECENCY_STALE_THRESHOLD", 0.4)
+QUALITY_LOW_THRESHOLD = _safe_env_float("MEMTOOL_QUALITY_LOW_THRESHOLD", 0.5)
+ACCESS_LOW_THRESHOLD = _safe_env_float("MEMTOOL_ACCESS_LOW_THRESHOLD", 0.2)
+QUANTITY_LOW_THRESHOLD = _safe_env_float("MEMTOOL_QUANTITY_LOW_THRESHOLD", 0.3)
 
 # confidence_level 映射
 CONFIDENCE_LEVEL_MAP: Dict[str, float] = {
@@ -128,7 +145,7 @@ def calc_access_score(items: List[Dict[str, Any]]) -> float:
     if not items:
         return 0.0
 
-    total_access = sum(item.get("access_count", 0) for item in items)
+    total_access = sum(max(0, item.get("access_count", 0)) for item in items)
 
     # log1p(access) / log(100) 归一化
     # access=0 -> 0, access=100 -> 1.0
