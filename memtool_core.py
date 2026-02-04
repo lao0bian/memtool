@@ -72,6 +72,12 @@ CREATE TABLE IF NOT EXISTS memory_items (
   content TEXT NOT NULL,
   content_search TEXT NOT NULL DEFAULT '',
   tags_json TEXT NOT NULL DEFAULT '[]',  -- JSON array of strings
+  -- Phase 2-2: Contextual Memory Fields
+  context_tags_json TEXT NOT NULL DEFAULT '[]',
+  emotional_valence REAL NOT NULL DEFAULT 0.0,
+  urgency_level INTEGER NOT NULL DEFAULT 0,
+  related_json TEXT NOT NULL DEFAULT '[]',
+  session_id TEXT,
   source TEXT,
   weight REAL NOT NULL DEFAULT 1.0,
   version INTEGER NOT NULL DEFAULT 1,
@@ -154,11 +160,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> bool:
     _ensure_confidence_level_column(conn)  # 添加 confidence_level 列
     _ensure_verified_by_column(conn)  # 添加 verified_by 列
     _ensure_phase2_columns(conn)  # Phase 2-1: 添加记忆巩固字段
+    _ensure_phase2_2a_columns(conn)  # Phase 2-2a: 添加情境字段
     _ensure_history_table(conn)  # Phase 2.6: 添加历史表
     
     # Create indexes after ensuring columns exist
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_confidence ON memory_items(confidence_level)")
     _ensure_phase2_indexes(conn)  # Phase 2-1: 创建巩固字段的索引
+    _ensure_phase2_2a_indexes(conn)  # Phase 2-2a: 创建情境字段索引
 
     needs_backfill = added_column
     if not needs_backfill:
@@ -342,6 +350,43 @@ def _ensure_phase2_columns(conn: sqlite3.Connection) -> bool:
     return added
 
 
+def _ensure_phase2_2a_columns(conn: sqlite3.Connection) -> bool:
+    """Phase 2-2a: 添加情境字段"""
+    added = False
+
+    if not _column_exists(conn, "memory_items", "context_tags_json"):
+        conn.execute("ALTER TABLE memory_items ADD COLUMN context_tags_json TEXT NOT NULL DEFAULT '[]'")
+        added = True
+
+    if not _column_exists(conn, "memory_items", "emotional_valence"):
+        conn.execute("ALTER TABLE memory_items ADD COLUMN emotional_valence REAL NOT NULL DEFAULT 0.0")
+        added = True
+
+    if not _column_exists(conn, "memory_items", "urgency_level"):
+        conn.execute("ALTER TABLE memory_items ADD COLUMN urgency_level INTEGER NOT NULL DEFAULT 0")
+        added = True
+
+    if not _column_exists(conn, "memory_items", "related_json"):
+        conn.execute("ALTER TABLE memory_items ADD COLUMN related_json TEXT NOT NULL DEFAULT '[]'")
+        added = True
+
+    if not _column_exists(conn, "memory_items", "session_id"):
+        conn.execute("ALTER TABLE memory_items ADD COLUMN session_id TEXT")
+        added = True
+
+    return added
+
+
+def _ensure_phase2_2a_indexes(conn: sqlite3.Connection) -> None:
+    """Phase 2-2a: 创建情境字段索引（仅当字段存在时）"""
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_emotional ON memory_items(emotional_valence)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_urgency ON memory_items(urgency_level)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_session ON memory_items(session_id)")
+    except sqlite3.OperationalError:
+        pass
+
+
 def _ensure_history_table(conn: sqlite3.Connection) -> bool:
     """Phase 2.6: 确保 memory_history 表存在"""
     conn.execute("""
@@ -489,6 +534,31 @@ def _row_to_obj(r: sqlite3.Row) -> Dict[str, Any]:
         obj["consolidation_score"] = r["consolidation_score"]
     except (KeyError, IndexError):
         obj["consolidation_score"] = 0.0
+
+    try:
+        obj["context_tags"] = json.loads(r["context_tags_json"] or "[]")
+    except (KeyError, IndexError, TypeError):
+        obj["context_tags"] = []
+
+    try:
+        obj["emotional_valence"] = r["emotional_valence"]
+    except (KeyError, IndexError):
+        obj["emotional_valence"] = 0.0
+
+    try:
+        obj["urgency_level"] = r["urgency_level"]
+    except (KeyError, IndexError):
+        obj["urgency_level"] = 0
+
+    try:
+        obj["related"] = json.loads(r["related_json"] or "[]")
+    except (KeyError, IndexError, TypeError):
+        obj["related"] = []
+
+    try:
+        obj["session_id"] = r["session_id"]
+    except (KeyError, IndexError):
+        obj["session_id"] = None
 
     return obj
 
@@ -740,6 +810,7 @@ class MemoryStore(SemanticSearchMixin):
         weight: float = 1.0,
         confidence_level: str = "medium",
         verified_by: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         conn: Optional[sqlite3.Connection] = None
         try:
@@ -748,6 +819,12 @@ class MemoryStore(SemanticSearchMixin):
             tags_json = json.dumps(tags or [], ensure_ascii=False)
             weight_value = _coerce_weight(weight)
             content_search = _build_content_search(content)
+            from memtool.context.extractor import ContextExtractor
+            context_tags, emotional_valence, urgency_level = ContextExtractor.extract(
+                content=content,
+                metadata={"type": type, "task_id": task_id, "step_id": step_id},
+            )
+            context_tags_json = json.dumps(context_tags, ensure_ascii=False)
 
             if item_id:
                 cur = conn.execute("SELECT * FROM memory_items WHERE id = ?", (item_id,))
@@ -764,13 +841,20 @@ class MemoryStore(SemanticSearchMixin):
                 _save_history(conn, item_id, row, "update")
 
                 version = int(row["version"]) + 1
+                try:
+                    related_json = row["related_json"] or "[]"
+                except (KeyError, IndexError):
+                    related_json = "[]"
                 conn.execute("""
                 UPDATE memory_items
-                SET type=?, task_id=?, step_id=?, key=?, content=?, content_search=?, tags_json=?, source=?, weight=?, version=?, updated_at=?, confidence_level=?, verified_by=?
+                SET type=?, task_id=?, step_id=?, key=?, content=?, content_search=?, tags_json=?,
+                    context_tags_json=?, emotional_valence=?, urgency_level=?, related_json=?, session_id=?,
+                    source=?, weight=?, version=?, updated_at=?, confidence_level=?, verified_by=?
                 WHERE id=?
                 """, (
                     type, task_id, step_id, key, content, content_search,
-                    tags_json, source, weight_value, version, now, confidence_level, verified_by, item_id
+                    tags_json, context_tags_json, emotional_valence, urgency_level, related_json, session_id,
+                    source, weight_value, version, now, confidence_level, verified_by, item_id
                 ))
                 action = "updated"
                 final_id = item_id
@@ -783,26 +867,38 @@ class MemoryStore(SemanticSearchMixin):
                     old_row = conn.execute("SELECT * FROM memory_items WHERE id = ?", (final_id,)).fetchone()
                     if old_row:
                         _save_history(conn, final_id, old_row, "update")
-                    
+
                     version = int(existing["version"]) + 1
+                    try:
+                        related_json = old_row["related_json"] or "[]"
+                    except (KeyError, IndexError, TypeError):
+                        related_json = "[]"
                     conn.execute("""
                     UPDATE memory_items
-                    SET type=?, task_id=?, step_id=?, key=?, content=?, content_search=?, tags_json=?, source=?, weight=?, version=?, updated_at=?, confidence_level=?, verified_by=?
+                    SET type=?, task_id=?, step_id=?, key=?, content=?, content_search=?, tags_json=?,
+                        context_tags_json=?, emotional_valence=?, urgency_level=?, related_json=?, session_id=?,
+                        source=?, weight=?, version=?, updated_at=?, confidence_level=?, verified_by=?
                     WHERE id=?
                     """, (
                         type, task_id, step_id, key, content, content_search,
-                        tags_json, source, weight_value, version, now, confidence_level, verified_by, final_id
+                        tags_json, context_tags_json, emotional_valence, urgency_level, related_json, session_id,
+                        source, weight_value, version, now, confidence_level, verified_by, final_id
                     ))
                     action = "updated"
                 else:
                     final_id = gen_id()
                     version = 1
                     conn.execute("""
-                    INSERT INTO memory_items(id, type, task_id, step_id, key, content, content_search, tags_json, source, weight, version, created_at, updated_at, confidence_level, verified_by)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO memory_items(
+                        id, type, task_id, step_id, key, content, content_search, tags_json,
+                        context_tags_json, emotional_valence, urgency_level, related_json, session_id,
+                        source, weight, version, created_at, updated_at, confidence_level, verified_by
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (
                         final_id, type, task_id, step_id, key, content, content_search,
-                        tags_json, source, weight_value, version, now, now, confidence_level, verified_by
+                        tags_json, context_tags_json, emotional_valence, urgency_level, "[]", session_id,
+                        source, weight_value, version, now, now, confidence_level, verified_by
                     ))
                     action = "inserted"
 
@@ -1090,6 +1186,89 @@ class MemoryStore(SemanticSearchMixin):
 
         return {"ok": False, "error": "UNKNOWN", "items": []}
 
+    def contextual_search(
+        self,
+        *,
+        query: str,
+        context_tags: Optional[List[str]] = None,
+        emotional_filter: Optional[str] = None,
+        urgency_min: Optional[int] = None,
+        urgency_level: Optional[int] = None,
+        limit: int = 10,
+        type: Optional[str] = None,
+        task_id: Optional[str] = None,
+        include_stale: bool = True,
+        stale_threshold: float = DEFAULT_STALE_THRESHOLD,
+    ) -> Dict[str, Any]:
+        """情境检索：基于上下文标签/情绪/紧急度过滤。"""
+        try:
+            fetch_limit = max(int(limit) * 3, 30)
+        except (TypeError, ValueError):
+            fetch_limit = 30
+
+        try:
+            base_results = self.hybrid_search(
+                query=query,
+                type=type,
+                task_id=task_id,
+                limit=fetch_limit,
+            )
+        except Exception:
+            base_results = self.search(
+                query=query,
+                type=type,
+                task_id=task_id,
+                limit=fetch_limit,
+                include_stale=include_stale,
+                stale_threshold=stale_threshold,
+            )
+
+        items = base_results.get("items", [])
+        if not include_stale:
+            items = [i for i in items if not i.get("is_stale")]
+
+        filtered: List[Dict[str, Any]] = []
+        for item in items:
+            item_tags = item.get("context_tags", []) or []
+            item_valence = item.get("emotional_valence", 0.0) or 0.0
+            item_urgency = item.get("urgency_level", 0) or 0
+
+            if context_tags:
+                overlap = len(set(context_tags) & set(item_tags))
+                if overlap == 0:
+                    continue
+                item["context_match_score"] = overlap / len(context_tags)
+
+            if emotional_filter:
+                if emotional_filter == "positive" and item_valence <= 0:
+                    continue
+                if emotional_filter == "negative" and item_valence >= 0:
+                    continue
+                if emotional_filter == "neutral" and item_valence != 0:
+                    continue
+
+            if urgency_level is not None and item_urgency != int(urgency_level):
+                continue
+            if urgency_min is not None and item_urgency < int(urgency_min):
+                continue
+
+            filtered.append(item)
+
+        if context_tags:
+            filtered.sort(key=lambda x: x.get("context_match_score", 0), reverse=True)
+
+        return {
+            "ok": True,
+            "items": filtered[: int(limit)],
+            "total_found": len(filtered),
+            "filters_applied": {
+                "context_tags": context_tags,
+                "emotional_filter": emotional_filter,
+                "urgency_min": urgency_min,
+                "urgency_level": urgency_level,
+            },
+        }
+
     def delete(self, *, item_id: str) -> Dict[str, Any]:
         conn: Optional[sqlite3.Connection] = None
         try:
@@ -1240,13 +1419,34 @@ class MemoryStore(SemanticSearchMixin):
                 cur = conn.execute("SELECT id FROM memory_items WHERE id = ?", (item_id,))
                 row = cur.fetchone()
                 tags = obj.get("tags", [])
+                context_tags = obj.get("context_tags")
+                if context_tags is None:
+                    context_tags = obj.get("context_tags_json")
+                if isinstance(context_tags, str):
+                    context_tags_json = context_tags
+                else:
+                    context_tags_json = json.dumps(context_tags or [], ensure_ascii=False)
+                related = obj.get("related")
+                if related is None:
+                    related = obj.get("related_json")
+                if isinstance(related, str):
+                    related_json = related
+                else:
+                    related_json = json.dumps(related or [], ensure_ascii=False)
+                emotional_valence = obj.get("emotional_valence", 0.0)
+                urgency_level = int(obj.get("urgency_level", 0))
+                session_id = obj.get("session_id")
                 weight_value = _coerce_weight(obj.get("weight", 1.0))
                 content = obj.get("content", "")
                 content_search = obj.get("content_search") or _build_content_search(content)
                 if row is None:
                     conn.execute("""
-                    INSERT INTO memory_items(id, type, task_id, step_id, key, content, content_search, tags_json, source, weight, version, created_at, updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO memory_items(
+                        id, type, task_id, step_id, key, content, content_search, tags_json,
+                        context_tags_json, emotional_valence, urgency_level, related_json, session_id,
+                        source, weight, version, created_at, updated_at
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (
                         item_id,
                         obj.get("type", "feature"),
@@ -1256,6 +1456,11 @@ class MemoryStore(SemanticSearchMixin):
                         content,
                         content_search,
                         json.dumps(tags, ensure_ascii=False),
+                        context_tags_json,
+                        emotional_valence,
+                        urgency_level,
+                        related_json,
+                        session_id,
                         obj.get("source"),
                         weight_value,
                         int(obj.get("version", 1)),
@@ -1266,7 +1471,9 @@ class MemoryStore(SemanticSearchMixin):
                 else:
                     conn.execute("""
                     UPDATE memory_items
-                    SET type=?, task_id=?, step_id=?, key=?, content=?, content_search=?, tags_json=?, source=?, weight=?, version=?, updated_at=?
+                    SET type=?, task_id=?, step_id=?, key=?, content=?, content_search=?, tags_json=?,
+                        context_tags_json=?, emotional_valence=?, urgency_level=?, related_json=?, session_id=?,
+                        source=?, weight=?, version=?, updated_at=?
                     WHERE id=?
                     """, (
                         obj.get("type", "feature"),
@@ -1276,6 +1483,11 @@ class MemoryStore(SemanticSearchMixin):
                         content,
                         content_search,
                         json.dumps(tags, ensure_ascii=False),
+                        context_tags_json,
+                        emotional_valence,
+                        urgency_level,
+                        related_json,
+                        session_id,
                         obj.get("source"),
                         weight_value,
                         int(obj.get("version", 1)),

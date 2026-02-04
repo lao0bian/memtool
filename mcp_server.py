@@ -225,6 +225,148 @@ def _normalize_tags(tags: Optional[Any]) -> Optional[List[str]]:
     return None
 
 
+def memory_contextual_search_impl(
+    *,
+    query: str,
+    context_tags: Optional[Any] = None,
+    emotional_filter: Optional[str] = None,
+    urgency_min: Optional[int] = None,
+    urgency_level: Optional[int] = None,
+    limit: int = 10,
+    type: Optional[str] = None,
+    task_id: Optional[str] = None,
+    include_stale: bool = True,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not query or not str(query).strip():
+        return _param_error("query cannot be empty")
+    if type is not None and type not in _VALID_TYPES:
+        return _param_error("type must be one of: project, feature, run")
+    try:
+        limit_value = int(limit)
+    except (TypeError, ValueError):
+        return _param_error("limit must be an integer")
+    if limit_value < 1:
+        return _param_error("limit must be >= 1")
+    if emotional_filter is not None and emotional_filter not in {"positive", "negative", "neutral"}:
+        return _param_error("emotional_filter must be one of: positive, negative, neutral")
+    try:
+        urgency_min_value = int(urgency_min) if urgency_min is not None else None
+    except (TypeError, ValueError):
+        return _param_error("urgency_min must be an integer")
+    try:
+        urgency_level_value = int(urgency_level) if urgency_level is not None else None
+    except (TypeError, ValueError):
+        return _param_error("urgency_level must be an integer")
+
+    try:
+        store = _store_for(db_path)
+        return store.contextual_search(
+            query=str(query),
+            context_tags=_normalize_tags(context_tags),
+            emotional_filter=emotional_filter,
+            urgency_min=urgency_min_value,
+            urgency_level=urgency_level_value,
+            limit=limit_value,
+            type=type,
+            task_id=task_id,
+            include_stale=include_stale,
+        )
+    except MemtoolError as e:
+        return e.payload
+    except Exception as e:
+        return _unexpected_error("memory_contextual_search", e)
+
+
+def memory_parse_context_impl(
+    *,
+    natural_query: str,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not natural_query or not str(natural_query).strip():
+        return _param_error("natural_query cannot be empty")
+
+    import re
+    from memtool.context.extractor import ContextTags
+
+    query_text = str(natural_query)
+    context_tags: List[str] = []
+    emotional_filter: Optional[str] = None
+    urgency_level: Optional[int] = None
+
+    time_patterns = {
+        r"昨晚|昨天晚上|last\\s+night": ContextTags.TIME_LATE_NIGHT,
+        r"今早|今天早上|this\\s+morning": ContextTags.TIME_EARLY_MORNING,
+        r"周末|weekend": ContextTags.TIME_WEEKEND,
+        r"上班时间|工作时间|work\\s+hours?": ContextTags.TIME_WORK_HOURS,
+        r"今晚|今天晚上|this\\s+evening": ContextTags.TIME_EVENING,
+    }
+
+    emotion_patterns = [
+        (r"失败|没搞定|问题|failed|broken", "negative"),
+        (r"成功|解决了|搞定|succeeded?|fixed", "positive"),
+    ]
+
+    urgency_patterns = {
+        r"P0|紧急|阻塞|马上|critical|blocking": 3,
+        r"P1|urgent|asap|重要|优先": 2,
+        r"P2|soon|尽快": 1,
+    }
+
+    task_patterns = {
+        r"调试|debug": ContextTags.TASK_DEBUGGING,
+        r"测试|test": ContextTags.TASK_TESTING,
+        r"部署|deploy": ContextTags.TASK_DEPLOYMENT,
+        r"重构|refactor": ContextTags.TASK_REFACTOR,
+        r"接口|api|endpoint": ContextTags.TASK_API_DESIGN,
+        r"数据库|表结构|schema|migration": ContextTags.TASK_DATA_MODEL,
+    }
+
+    for pattern, tag in time_patterns.items():
+        if re.search(pattern, query_text, re.IGNORECASE):
+            context_tags.append(tag)
+            query_text = re.sub(pattern, "", query_text, flags=re.IGNORECASE)
+
+    for pattern, emotion in emotion_patterns:
+        if re.search(pattern, query_text, re.IGNORECASE):
+            emotional_filter = emotion
+            query_text = re.sub(pattern, "", query_text, flags=re.IGNORECASE)
+            break
+
+    for pattern, level in urgency_patterns.items():
+        if re.search(pattern, query_text, re.IGNORECASE):
+            urgency_level = level
+            query_text = re.sub(pattern, "", query_text, flags=re.IGNORECASE)
+            break
+
+    for pattern, tag in task_patterns.items():
+        if re.search(pattern, query_text, re.IGNORECASE):
+            context_tags.append(tag)
+
+    query_text = re.sub(r"(那个|的|这个|上次|之前|that|the|this)", "", query_text, flags=re.IGNORECASE)
+    query_text = query_text.strip()
+
+    return {
+        "ok": True,
+        "original_query": natural_query,
+        "parsed": {
+            "query": query_text or natural_query,
+            "context_tags": context_tags,
+            "emotional_filter": emotional_filter,
+            "urgency_level": urgency_level,
+        },
+        "suggested_call": {
+            "tool": "memory_contextual_search",
+            "args": {
+                "query": query_text or natural_query,
+                "context_tags": context_tags if context_tags else None,
+                "emotional_filter": emotional_filter,
+                "urgency_level": urgency_level,
+            },
+        },
+    }
+
+
 if FastMCP is not None:
     mcp = FastMCP("memtool")
 
@@ -239,6 +381,7 @@ if FastMCP is not None:
         tags: Optional[Any] = None,
         source: Optional[str] = None,
         weight: float = 1.0,
+        session_id: Optional[str] = None,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Store or update memory (upsert by id or logical key)."""
@@ -272,6 +415,7 @@ if FastMCP is not None:
                     tags=_normalize_tags(tags),
                     source=source,
                     weight=weight_value,
+                    session_id=session_id,
                 )
         except MemtoolError as e:
             return e.payload
@@ -347,6 +491,41 @@ if FastMCP is not None:
             return e.payload
         except Exception as e:
             return _unexpected_error("memory_search", e)
+
+    @mcp.tool()
+    def memory_contextual_search(
+        query: str,
+        context_tags: Optional[Any] = None,
+        emotional_filter: Optional[str] = None,
+        urgency_min: Optional[int] = None,
+        urgency_level: Optional[int] = None,
+        limit: int = 10,
+        type: Optional[str] = None,
+        task_id: Optional[str] = None,
+        include_stale: bool = True,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """情境检索：基于上下文标签/情绪/紧急度过滤"""
+        return memory_contextual_search_impl(
+            query=query,
+            context_tags=context_tags,
+            emotional_filter=emotional_filter,
+            urgency_min=urgency_min,
+            urgency_level=urgency_level,
+            limit=limit,
+            type=type,
+            task_id=task_id,
+            include_stale=include_stale,
+            db_path=db_path,
+        )
+
+    @mcp.tool()
+    def memory_parse_context(
+        natural_query: str,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """解析自然语言查询，提取情境条件"""
+        return memory_parse_context_impl(natural_query=natural_query, db_path=db_path)
 
     @mcp.tool()
     def memory_list(

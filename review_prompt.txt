@@ -1,0 +1,17 @@
+Review docs/PHASE2_2_CONTEXTUAL_MEMORY.md design doc and provide:
+
+1. Overall score (1-10)
+2. Pros list
+3. Cons and Risks list  
+4. Improvement suggestions
+
+Focus on these aspects:
+- Is the architecture reasonable? Over-designed or under-designed?
+- Are the 4 new fields (context_tags_json, emotional_valence, related_ids_json, session_id) sufficient?
+- Is ContextExtractor keyword matching too simple? Need smarter methods?
+- Are MemoryLinker thresholds (0.4-0.8) reasonable?
+- Performance risk: will doing extraction+linking in put() slow down writes?
+- Any missing edge cases or risks?
+- Is the implementation timeline realistic?
+
+Output in Chinese.

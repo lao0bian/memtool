@@ -1,0 +1,29 @@
+Implement Phase 2.2a of the contextual memory system based on docs/PHASE2_2_CONTEXTUAL_MEMORY_v2.md
+
+Tasks:
+1. Database migration: Add 5 new fields (context_tags_json, emotional_valence, urgency_level, related_json, session_id) and 3 indexes
+2. Create memtool/context/__init__.py and memtool/context/extractor.py with ContextTags constants and ContextExtractor v2 (with negation detection)
+3. Modify memtool_core.py put() method to call ContextExtractor and store context fields (DO NOT add linking yet - that's Phase 2.2b)
+4. Add memory_contextual_search MCP tool in mcp_server.py
+5. Add memory_parse_context MCP tool in mcp_server.py
+6. Create test_phase2_2a.py with tests for:
+   - Schema has new columns
+   - ContextExtractor extracts time/task/emotion tags
+   - Negation detection works ("没解决" = negative)
+   - Urgency level extraction
+   - memory_contextual_search filters correctly
+   - memory_parse_context parses natural language
+
+Key requirements:
+- All tags use unified namespace: time:xxx, task:xxx, emotion:xxx, lang:xxx
+- Negation words flip emotion detection
+- Urgency is separate from emotional_valence (0-3 scale)
+- put() latency increase should be < 5ms
+- All existing tests must still pass
+
+Reference files:
+- docs/PHASE2_2_CONTEXTUAL_MEMORY_v2.md (full design)
+- memtool_core.py (existing core logic)
+- mcp_server.py (existing MCP tools)
+
+When completely finished, run: openclaw gateway wake --text "Phase 2.2a done: contextual memory fields + extraction + search implemented" --mode now
