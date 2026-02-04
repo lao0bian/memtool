@@ -69,6 +69,15 @@ DEPRECATED_DEFAULTS = {
 }
 
 
+def _filter_core_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+    """过滤只返回核心字段（瘦身后使用）
+    
+    移除排序计算产生的临时字段（age_days, decay_score, is_stale, 
+    confidence_score, recency_score, mixed_score）和废弃字段
+    """
+    return {k: v for k, v in item.items() if k in CORE_FIELDS}
+
+
 class MemtoolError(Exception):
     def __init__(self, payload: Dict[str, Any], exit_code: int) -> None:
         self.payload = payload
@@ -1151,7 +1160,8 @@ class MemoryStore(SemanticSearchMixin):
             else:
                 items = items[:int(limit)]
 
-            return items
+            # 瘦身后：过滤掉排序计算产生的临时字段，只返回核心字段
+            return [_filter_core_fields(item) for item in items]
 
         except sqlite3.Error as e:
             _raise_db_error(e)
@@ -1261,7 +1271,9 @@ class MemoryStore(SemanticSearchMixin):
             access_ids = [item["id"] for item in items[: int(limit)]]
             self._track_access_batch(access_ids)
 
-            return {"ok": True, "fts5": fts_ok, "items": items[: int(limit)]}
+            # 瘦身后：过滤只返回核心字段
+            filtered_items = [_filter_core_fields(item) for item in items[: int(limit)]]
+            return {"ok": True, "fts5": fts_ok, "items": filtered_items}
 
         except sqlite3.Error as e:
             _raise_db_error(e)
@@ -1339,9 +1351,11 @@ class MemoryStore(SemanticSearchMixin):
         if context_tags:
             filtered.sort(key=lambda x: x.get("context_match_score", 0), reverse=True)
 
+        # 瘦身后：过滤只返回核心字段
+        filtered_items = [_filter_core_fields(item) for item in filtered[: int(limit)]]
         return {
             "ok": True,
-            "items": filtered[: int(limit)],
+            "items": filtered_items,
             "total_found": len(filtered),
             "filters_applied": {
                 "context_tags": context_tags,
@@ -1418,7 +1432,9 @@ class MemoryStore(SemanticSearchMixin):
             access_ids = [item["id"] for item in recs]
             self._track_access_batch(access_ids)
             
-            return {"ok": True, "items": recs, "candidates": len(items), "limit": int(limit)}
+            # 瘦身后：过滤只返回核心字段
+            filtered_recs = [_filter_core_fields(item) for item in recs]
+            return {"ok": True, "items": filtered_recs, "candidates": len(items), "limit": int(limit)}
         except sqlite3.Error as e:
             _raise_db_error(e)
 

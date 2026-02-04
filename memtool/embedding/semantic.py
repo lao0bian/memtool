@@ -17,6 +17,20 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# 核心字段（与 memtool_core.py 保持一致）
+CORE_FIELDS = [
+    'id', 'type', 'key', 'content', 'tags',
+    'created_at', 'updated_at', 'version',
+    'access_count', 'last_accessed_at',
+    'confidence_level', 'verified_by'
+]
+
+
+def _filter_core_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+    """过滤只返回核心字段（瘦身后使用）"""
+    return {k: v for k, v in item.items() if k in CORE_FIELDS}
+
+
 # Environment variables
 MEMTOOL_VECTOR_ENABLED = os.environ.get("MEMTOOL_VECTOR_ENABLED", "auto").lower()
 MEMTOOL_VECTOR_DIR = os.environ.get("MEMTOOL_VECTOR_DIR", "")
@@ -239,10 +253,12 @@ class SemanticSearchMixin:
                 min_score=min_score
             )
             
+            # 瘦身后：过滤只返回核心字段
+            filtered_results = [_filter_core_fields(item) for item in results]
             return {
                 "ok": True,
-                "items": results,
-                "count": len(results),
+                "items": filtered_results,
+                "count": len(filtered_results),
                 "limit": limit,
                 "min_score": min_score
             }
@@ -315,10 +331,12 @@ class SemanticSearchMixin:
                 where=where if where else None
             )
             
+            # 瘦身后：过滤只返回核心字段
+            filtered_results = [_filter_core_fields(item) for item in results]
             return {
                 "ok": True,
-                "items": results,
-                "count": len(results),
+                "items": filtered_results,
+                "count": len(filtered_results),
                 "limit": limit,
                 "mode": "hybrid",
                 "fts_weight": fts_weight,
