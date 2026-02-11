@@ -797,6 +797,7 @@ class MemoryStore(SemanticSearchMixin):
         type: Optional[str] = None,
         threshold: float = 0.8,
         limit: int = 5,
+        exclude_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         查找与给定 content 相似的已有记录（基于 Jaccard 相似度）
@@ -806,6 +807,7 @@ class MemoryStore(SemanticSearchMixin):
             type: 可选，仅在该 type 的记录中搜索
             threshold: 相似度阈值 (0.0 - 1.0)，默认 80%
             limit: 最多返回多少条相似结果
+            exclude_id: 排除指定 id（避免把当前记录当成重复）
 
         Returns:
             相似度 >= threshold 的记录列表，按相似度降序排列
@@ -837,6 +839,8 @@ class MemoryStore(SemanticSearchMixin):
             # 计算相似度
             results = []
             for row in rows:
+                if exclude_id and row["id"] == exclude_id:
+                    continue
                 candidate_keywords = _extract_keywords(row["content"])
                 similarity = _jaccard_similarity(query_keywords, candidate_keywords)
 
@@ -998,7 +1002,13 @@ class MemoryStore(SemanticSearchMixin):
                     pass  # Don't fail put if vector indexing fails
 
             # 相似度检查：在 insert 或 update 后，检查是否有类似的记录
-            similar_items = self.find_similar_items(content, type=type, threshold=0.8, limit=3)
+            similar_items = self.find_similar_items(
+                content,
+                type=type,
+                threshold=0.8,
+                limit=3,
+                exclude_id=final_id,
+            )
             if similar_items:
                 result["warning"] = "duplicate_detection"
                 result["similar_items"] = [
