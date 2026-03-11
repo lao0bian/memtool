@@ -414,6 +414,9 @@ def memory_parse_context_impl(
 if FastMCP is not None:
     mcp = FastMCP("memtool")
 
+    # ================================================================
+    # Tool 1/8: memory_store — 存储/更新记忆
+    # ================================================================
     @mcp.tool()
     def memory_store(
         type: str,
@@ -432,7 +435,7 @@ if FastMCP is not None:
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Store or update memory (upsert by id or logical key).
-        
+
         Args:
             type: Memory type (project/feature/run)
             key: Unique identifier
@@ -441,7 +444,7 @@ if FastMCP is not None:
             confidence_level: Confidence level (low/medium/high)
             verified_by: Optional verification source
             item_id: Optional id for update
-        
+
         Deprecated (ignored):
             task_id, step_id, source, weight, session_id
         """
@@ -475,6 +478,9 @@ if FastMCP is not None:
         except Exception as e:
             return _unexpected_error("memory_store", e)
 
+    # ================================================================
+    # Tool 2/8: memory_recall — 按 ID 或逻辑键获取记忆
+    # ================================================================
     @mcp.tool()
     def memory_recall(
         item_id: Optional[str] = None,
@@ -486,12 +492,12 @@ if FastMCP is not None:
         step_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Recall a memory by id or logical key (type+key).
-        
+
         Args:
             item_id: Get by id
             type: Memory type
             key: Unique identifier
-        
+
         Deprecated (ignored):
             task_id, step_id
         """
@@ -512,93 +518,87 @@ if FastMCP is not None:
         except Exception as e:
             return _unexpected_error("memory_recall", e)
 
+    # ================================================================
+    # Tool 3/8: memory_search — 统一搜索（合并 fts/semantic/hybrid/contextual）
+    # ================================================================
     @mcp.tool()
     def memory_search(
         query: str,
+        mode: str = "hybrid",
         type: Optional[str] = None,
+        limit: int = 10,
+        # FTS 专用
         key: Optional[str] = None,
-        limit: int = 20,
         sort_by: str = "updated",
         include_stale: bool = True,
-        db_path: Optional[str] = None,
-        # 废弃参数（保留兼容性，但忽略）
+        # Hybrid 专用
+        fts_weight: float = 0.3,
+        vector_weight: float = 0.7,
+        # Contextual 专用
+        context_tags: Optional[Any] = None,
+        emotional_filter: Optional[str] = None,
+        urgency_min: Optional[int] = None,
+        # Semantic 专用
+        min_score: float = 0.3,
+        # 通用
         task_id: Optional[str] = None,
-        step_id: Optional[str] = None,
+        db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Full-text search (FTS5 if available, else LIKE).
-        
+        """Hybrid search combining FTS5 keyword search and vector semantic search.
+
+        Best of both worlds: keyword matching + semantic understanding.
+
         Args:
-            query: Search query
-            type: Memory type filter
-            key: Key filter
-            limit: Max results
-        
-        Deprecated (ignored):
-            task_id, step_id
+            query: Search query text
+            mode: Search mode - "hybrid" (default, best quality), "fts" (fastest),
+                  "semantic" (vector only), "contextual" (filter by tags/emotion)
+            type: Optional memory type filter (project/feature/run)
+            limit: Max results (capped at 200)
         """
         if not query or not str(query).strip():
             return _param_error("query cannot be empty")
         if type is not None and type not in _VALID_TYPES:
             return _param_error("type must be one of: project, feature, run")
-        try:
-            limit_value = int(limit)
-        except (TypeError, ValueError):
-            return _param_error("limit must be an integer")
-        if limit_value < 1:
-            return _param_error("limit must be >= 1")
+
+        limit = _clamp_limit(limit)
 
         try:
             store = _store_for(db_path)
-            return store.search(
-                query=str(query),
-                type=type,
-                key=key,
-                limit=limit_value,
-                sort_by=sort_by,
-                include_stale=include_stale,
-            )
+
+            if mode == "fts":
+                return store.search(
+                    query=str(query), type=type, key=key,
+                    limit=limit, sort_by=sort_by, include_stale=include_stale,
+                )
+            elif mode == "semantic":
+                return store.semantic_search(
+                    query=str(query), type=type, task_id=task_id,
+                    limit=limit, min_score=min_score,
+                )
+            elif mode == "contextual":
+                return memory_contextual_search_impl(
+                    query=query, context_tags=context_tags,
+                    emotional_filter=emotional_filter, urgency_min=urgency_min,
+                    limit=limit, type=type, task_id=task_id,
+                    include_stale=include_stale, db_path=db_path,
+                )
+            else:  # hybrid (default)
+                return store.hybrid_search(
+                    query=str(query), type=type, task_id=task_id,
+                    limit=limit, fts_weight=fts_weight,
+                    vector_weight=vector_weight,
+                )
         except MemtoolError as e:
             return e.payload
         except Exception as e:
             return _unexpected_error("memory_search", e)
 
-    @mcp.tool()
-    def memory_contextual_search(
-        query: str,
-        context_tags: Optional[Any] = None,
-        emotional_filter: Optional[str] = None,
-        urgency_min: Optional[int] = None,
-        urgency_level: Optional[int] = None,
-        limit: int = 10,
-        type: Optional[str] = None,
-        task_id: Optional[str] = None,
-        include_stale: bool = True,
-        db_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """情境检索：基于上下文标签/情绪/紧急度过滤"""
-        return memory_contextual_search_impl(
-            query=query,
-            context_tags=context_tags,
-            emotional_filter=emotional_filter,
-            urgency_min=urgency_min,
-            urgency_level=urgency_level,
-            limit=limit,
-            type=type,
-            task_id=task_id,
-            include_stale=include_stale,
-            db_path=db_path,
-        )
-
-    @mcp.tool()
-    def memory_parse_context(
-        natural_query: str,
-        db_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """解析自然语言查询，提取情境条件"""
-        return memory_parse_context_impl(natural_query=natural_query, db_path=db_path)
-
+    # ================================================================
+    # Tool 4/8: memory_list — 列出/推荐记忆
+    # ================================================================
     @mcp.tool()
     def memory_list(
+        mode: str = "list",
         type: Optional[str] = None,
         key: Optional[str] = None,
         tags: Optional[Any] = None,
@@ -606,134 +606,62 @@ if FastMCP is not None:
         offset: int = 0,
         sort_by: str = "updated",
         include_stale: bool = True,
+        # recommend 专用
+        context: Optional[str] = None,
+        key_prefix: Optional[str] = None,
         db_path: Optional[str] = None,
-        # 废弃参数（保留兼容性，但忽略）
+        # 废弃参数
         task_id: Optional[str] = None,
         step_id: Optional[str] = None,
     ) -> Any:
         """List memories with optional filters.
-        
+
         Args:
+            mode: "list" (default) or "recommend" (context-based recommendations)
             type: Memory type filter
             key: Key filter
             tags: Tags filter
             limit, offset: Pagination
-        
+
         Deprecated (ignored):
             task_id, step_id
         """
         if type is not None and type not in _VALID_TYPES:
             return _param_error("type must be one of: project, feature, run")
-        if tags is not None and not isinstance(tags, (str, list)):
-            return _param_error("tags must be a string or list")
-        try:
-            limit_value = int(limit)
-            offset_value = int(offset)
-        except (TypeError, ValueError):
-            return _param_error("limit/offset must be integers")
-        if limit_value < 1:
-            return _param_error("limit must be >= 1")
-        if offset_value < 0:
-            return _param_error("offset must be >= 0")
+
+        limit = _clamp_limit(limit)
 
         try:
             store = _store_for(db_path)
-            rows = store.list(
-                type=type,
-                key=key,
-                tags=_normalize_tags(tags),
-                limit=limit_value,
-                offset=offset_value,
-                sort_by=sort_by,
-                include_stale=include_stale,
-            )
-            return {"ok": True, "items": rows, "limit": limit_value, "offset": offset_value}
+
+            if mode == "recommend":
+                return store.recommend(
+                    context=context, type=type,
+                    tags=_normalize_tags(tags), key_prefix=key_prefix,
+                    limit=limit, include_stale=include_stale,
+                )
+            else:  # list (default)
+                try:
+                    offset_value = int(offset)
+                except (TypeError, ValueError):
+                    return _param_error("offset must be an integer")
+                if offset_value < 0:
+                    return _param_error("offset must be >= 0")
+
+                rows = store.list(
+                    type=type, key=key, tags=_normalize_tags(tags),
+                    limit=limit, offset=offset_value,
+                    sort_by=sort_by, include_stale=include_stale,
+                )
+                return {"ok": True, "items": rows, "limit": limit, "offset": offset_value}
         except MemtoolError as e:
             return e.payload
         except Exception as e:
             return _unexpected_error("memory_list", e)
 
-    @mcp.tool()
-    def memory_recommend(
-        context: Optional[str] = None,
-        type: Optional[str] = None,
-        tags: Optional[Any] = None,
-        key_prefix: Optional[str] = None,
-        limit: int = 10,
-        include_stale: bool = False,
-        db_path: Optional[str] = None,
-        # 废弃参数（保留兼容性，但忽略）
-        task_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Recommend related memories based on context.
-        
-        Args:
-            context: Current context or question
-            type: Memory type filter
-            tags: Tags filter
-            key_prefix: Key prefix filter
-            limit: Max results
-        
-        Deprecated (ignored):
-            task_id
-        """
-        if type is not None and type not in _VALID_TYPES:
-            return _param_error("type must be one of: project, feature, run")
-        try:
-            limit_value = int(limit)
-        except (TypeError, ValueError):
-            return _param_error("limit must be an integer")
-        if limit_value < 1:
-            return _param_error("limit must be >= 1")
-
-        try:
-            store = _store_for(db_path)
-            return store.recommend(
-                context=context,
-                type=type,
-                tags=_normalize_tags(tags),
-                key_prefix=key_prefix,
-                limit=limit_value,
-                include_stale=include_stale,
-            )
-        except MemtoolError as e:
-            return e.payload
-        except Exception as e:
-            return _unexpected_error("memory_recommend", e)
-
-    @mcp.tool()
-    def memory_cleanup(
-        type: Optional[str] = None,
-        older_than_days: Optional[float] = None,
-        stale_threshold: Optional[float] = None,
-        limit: int = 1000,
-        apply: bool = False,
-        db_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Cleanup stale memories (dry-run by default)."""
-        if type is not None and type not in _VALID_TYPES:
-            return _param_error("type must be one of: project, feature, run")
-        try:
-            limit_value = int(limit)
-        except (TypeError, ValueError):
-            return _param_error("limit must be an integer")
-        if limit_value < 1:
-            return _param_error("limit must be >= 1")
-
-        try:
-            store = _store_for(db_path)
-            return store.cleanup(
-                type=type,
-                older_than_days=older_than_days,
-                stale_threshold=stale_threshold,
-                limit=limit_value,
-                apply=apply,
-            )
-        except MemtoolError as e:
-            return e.payload
-        except Exception as e:
-            return _unexpected_error("memory_cleanup", e)
-
+    # ================================================================
+    # Tool 5/8: memory_delete — 删除记忆
+    # ================================================================
     @mcp.tool()
     def memory_delete(
         item_id: str,
@@ -752,191 +680,136 @@ if FastMCP is not None:
         except Exception as e:
             return _unexpected_error("memory_delete", e)
 
+    # ================================================================
+    # Tool 6/8: memory_maintain — 维护操作（cleanup/suggest_merge/export）
+    # ================================================================
     @mcp.tool()
-    def memory_export(
+    def memory_maintain(
+        action: str = "cleanup",
+        type: Optional[str] = None,
+        limit: int = 1000,
+        apply: bool = False,
+        # cleanup 专用
+        older_than_days: Optional[float] = None,
+        stale_threshold: Optional[float] = None,
+        # suggest_merge 专用
+        threshold: float = 0.85,
+        # export 专用
         output_path: Optional[str] = None,
         db_path: Optional[str] = None,
-    ) -> Any:
-        """Export memories. If output_path is provided, write JSONL and return meta; else return items list."""
-        if output_path is not None and not isinstance(output_path, str):
-            return _param_error("output_path must be a string")
-        if isinstance(output_path, str) and not output_path.strip():
-            return _param_error("output_path cannot be empty")
-
-        try:
-            store = _store_for(db_path)
-            rows = store.export_items()
-            if output_path:
-                os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
-                with open(output_path, "w", encoding="utf-8") as f:
-                    for r in rows:
-                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
-                return {"ok": True, "items": rows, "output": os.path.abspath(output_path), "count": len(rows)}
-            return {"ok": True, "items": rows}
-        except MemtoolError as e:
-            return e.payload
-        except Exception as e:
-            return _unexpected_error("memory_export", e)
-
-    @mcp.tool()
-    def memory_semantic_search(
-        query: str,
-        type: Optional[str] = None,
-        task_id: Optional[str] = None,
-        limit: int = 10,
-        min_score: float = 0.3,
-        db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Semantic vector search using embeddings.
-        
-        Uses local embedding model by default (BAAI/bge-small-zh-v1.5).
-        Configure with environment variables:
-        - MEMTOOL_EMBEDDING_PROVIDER: local, openai, or ollama
-        - MEMTOOL_EMBEDDING_MODEL: Override default model
-        - MEMTOOL_VECTOR_ENABLED: on, off, or auto
-        """
-        if not query or not str(query).strip():
-            return _param_error("query cannot be empty")
-        if type is not None and type not in _VALID_TYPES:
-            return _param_error("type must be one of: project, feature, run")
-        try:
-            limit_value = int(limit)
-        except (TypeError, ValueError):
-            return _param_error("limit must be an integer")
-        if limit_value < 1:
-            return _param_error("limit must be >= 1")
+        """Memory maintenance operations.
 
-        try:
-            store = _store_for(db_path)
-            return store.semantic_search(
-                query=str(query),
-                type=type,
-                task_id=task_id,
-                limit=limit_value,
-                min_score=min_score,
-            )
-        except MemtoolError as e:
-            return e.payload
-        except Exception as e:
-            return _unexpected_error("memory_semantic_search", e)
-
-    @mcp.tool()
-    def memory_hybrid_search(
-        query: str,
-        type: Optional[str] = None,
-        task_id: Optional[str] = None,
-        limit: int = 10,
-        fts_weight: float = 0.3,
-        vector_weight: float = 0.7,
-        db_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Hybrid search combining FTS5 keyword search and vector semantic search.
-        
-        Best of both worlds: keyword matching + semantic understanding.
-        """
-        if not query or not str(query).strip():
-            return _param_error("query cannot be empty")
-        if type is not None and type not in _VALID_TYPES:
-            return _param_error("type must be one of: project, feature, run")
-        try:
-            limit_value = int(limit)
-        except (TypeError, ValueError):
-            return _param_error("limit must be an integer")
-        if limit_value < 1:
-            return _param_error("limit must be >= 1")
-
-        try:
-            store = _store_for(db_path)
-            return store.hybrid_search(
-                query=str(query),
-                type=type,
-                task_id=task_id,
-                limit=limit_value,
-                fts_weight=fts_weight,
-                vector_weight=vector_weight,
-            )
-        except MemtoolError as e:
-            return e.payload
-        except Exception as e:
-            return _unexpected_error("memory_hybrid_search", e)
-
-    @mcp.tool()
-    def memory_vector_sync(
-        force: bool = False,
-        db_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Sync all memories to vector index.
-        
         Args:
-            force: If True, clear and rebuild entire index
+            action: "cleanup" (remove stale, dry-run by default),
+                    "suggest_merge" (find duplicates),
+                    "export" (backup to JSONL)
+            apply: For cleanup, set True to actually delete (default: dry-run)
         """
+        if type is not None and type not in _VALID_TYPES:
+            return _param_error("type must be one of: project, feature, run")
+
+        limit = _clamp_limit(limit)
+
         try:
             store = _store_for(db_path)
-            return store.vector_sync(force=force)
+
+            if action == "suggest_merge":
+                from memtool.merge import suggest_merges
+                return suggest_merges(store, type=type, threshold=threshold, limit=limit)
+
+            elif action == "export":
+                rows = store.export_items()
+                if output_path:
+                    if not isinstance(output_path, str) or not output_path.strip():
+                        return _param_error("output_path must be a non-empty string")
+                    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+                    with open(output_path, "w", encoding="utf-8") as f:
+                        for r in rows:
+                            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    return {"ok": True, "output": os.path.abspath(output_path), "count": len(rows)}
+                return {"ok": True, "items": rows}
+
+            else:  # cleanup (default)
+                return store.cleanup(
+                    type=type, older_than_days=older_than_days,
+                    stale_threshold=stale_threshold, limit=limit, apply=apply,
+                )
         except MemtoolError as e:
             return e.payload
         except Exception as e:
-            return _unexpected_error("memory_vector_sync", e)
+            return _unexpected_error("memory_maintain", e)
 
+    # ================================================================
+    # Tool 7/8: memory_info — 系统信息/诊断
+    # ================================================================
     @mcp.tool()
-    def memory_vector_status(
-        db_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get vector search status and statistics."""
-        try:
-            store = _store_for(db_path)
-            return store.vector_status()
-        except MemtoolError as e:
-            return e.payload
-        except Exception as e:
-            return _unexpected_error("memory_vector_status", e)
-
-    @mcp.tool()
-    def memory_stats(
-        db_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get basic memory statistics."""
-        try:
-            from memtool.observability import compute_stats
-            store = _store_for(db_path)
-            stats = compute_stats(store)
-            return {"ok": True, **stats}
-        except MemtoolError as e:
-            return e.payload
-        except Exception as e:
-            return _unexpected_error("memory_stats", e)
-
-    @mcp.tool()
-    def memory_health_check(
+    def memory_info(
+        scope: str = "stats",
+        # history 专用
+        item_id: Optional[str] = None,
+        limit: int = 10,
+        # vector_sync 专用
+        force: bool = False,
+        # health 专用
         thresholds: Optional[Dict[str, float]] = None,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Check memory health with optional thresholds."""
-        if thresholds is not None and not isinstance(thresholds, dict):
-            return _param_error("thresholds must be a dict")
+        """Get memory system information and diagnostics.
+
+        Args:
+            scope: "stats" (default), "health", "vector_status",
+                   "vector_sync", "history"
+            item_id: Required for scope="history"
+        """
         try:
-            from memtool.observability import health_check
             store = _store_for(db_path)
-            return health_check(store, thresholds=thresholds)
+
+            if scope == "health":
+                from memtool.observability import health_check
+                if thresholds is not None and not isinstance(thresholds, dict):
+                    return _param_error("thresholds must be a dict")
+                return health_check(store, thresholds=thresholds)
+
+            elif scope == "vector_status":
+                return store.vector_status()
+
+            elif scope == "vector_sync":
+                return store.vector_sync(force=force)
+
+            elif scope == "history":
+                if not item_id or not str(item_id).strip():
+                    return _param_error("item_id is required for scope='history'")
+                from memtool.history import get_history
+                return get_history(store, str(item_id).strip(), limit=_clamp_limit(limit))
+
+            else:  # stats (default)
+                from memtool.observability import compute_stats
+                stats = compute_stats(store)
+                return {"ok": True, **stats}
+
         except MemtoolError as e:
             return e.payload
         except Exception as e:
-            return _unexpected_error("memory_health_check", e)
+            return _unexpected_error("memory_info", e)
 
+    # ================================================================
+    # Tool 8/8: memory_assess_knowledge — 元认知评估
+    # ================================================================
     @mcp.tool()
     def memory_assess_knowledge(
         topic: str,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Phase 2-1: 评估 Agent 对某个主题的记忆可信度（元认知）
-        
+
         通过综合分析相关记忆的质量、数量、新鲜度和巩固程度，
         评估 Agent 对某个主题的掌握程度。
-        
+
         Args:
             topic: 要评估的主题
             db_path: 数据库路径（可选）
-        
+
         Returns:
             - confidence: "high" | "medium" | "low" | "none"
             - score: 元认知分数 (0.0 - 1.0)
@@ -946,79 +819,6 @@ if FastMCP is not None:
             - stats: 统计数据
         """
         return assess_knowledge(topic, db_path)
-
-    @mcp.tool()
-    def memory_history(
-        item_id: str,
-        limit: int = 10,
-        db_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Phase 2.6: 查看记忆的版本历史
-        
-        Args:
-            item_id: 记忆的 ID
-            limit: 最多返回多少条历史记录（默认 10）
-            db_path: 可选的数据库路径
-            
-        Returns:
-            包含版本历史的字典
-            
-        Example:
-            memory_history(item_id="abc123")
-            → {"ok": True, "history": [{"version": 2, "content": "..."}]}
-        """
-        if not item_id or not str(item_id).strip():
-            return _param_error("item_id cannot be empty")
-        
-        try:
-            from memtool.history import get_history
-            store = _store_for(db_path)
-            return get_history(store, str(item_id).strip(), limit=limit)
-        except MemtoolError as e:
-            return e.payload
-        except Exception as e:
-            return _unexpected_error("memory_history", e)
-
-    @mcp.tool()
-    def memory_suggest_merge(
-        type: Optional[str] = None,
-        threshold: float = 0.85,
-        limit: int = 10,
-        db_path: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Phase 2.6: 找出可能需要合并的相似记忆
-        
-        扫描记忆库，找出高相似度的记忆对，建议合并以减少冗余。
-        
-        Args:
-            type: 可选，仅在该 type 中搜索
-            threshold: 相似度阈值（默认 0.85，即 85%）
-            limit: 最多返回多少组建议（默认 10）
-            db_path: 可选的数据库路径
-            
-        Returns:
-            合并建议列表
-            
-        Example:
-            memory_suggest_merge(type="project", threshold=0.9)
-        """
-        from memtool.merge import suggest_merges
-        
-        if type is not None and type not in _VALID_TYPES:
-            return _param_error("type must be one of: project, feature, run")
-        
-        try:
-            store = _store_for(db_path)
-            return suggest_merges(
-                store,
-                type=type,
-                threshold=threshold,
-                limit=limit
-            )
-        except MemtoolError as e:
-            return e.payload
-        except Exception as e:
-            return _unexpected_error("memory_suggest_merge", e)
 
 else:
     mcp = None
