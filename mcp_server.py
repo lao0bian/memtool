@@ -58,10 +58,28 @@ def _ensure_db(db_path: str) -> None:
         init_db(db_path)
 
 
+# MemoryStore 单例缓存：避免每次 MCP 调用都新建实例
+_STORE_CACHE: Dict[str, MemoryStore] = {}
+_STORE_CACHE_LOCK = threading.Lock()
+
+
 def _store_for(db_path: Optional[str]) -> MemoryStore:
     path = _resolve_db_path(db_path)
-    _ensure_db(path)
-    return MemoryStore(path)
+    if path not in _STORE_CACHE:
+        with _STORE_CACHE_LOCK:
+            if path not in _STORE_CACHE:
+                _ensure_db(path)
+                _STORE_CACHE[path] = MemoryStore(path)
+    return _STORE_CACHE[path]
+
+
+# 安全加固：limit 上限
+MAX_LIMIT = 200
+
+
+def _clamp_limit(limit: int) -> int:
+    """Clamp limit to [1, MAX_LIMIT] to prevent resource exhaustion."""
+    return max(1, min(int(limit), MAX_LIMIT))
 
 
 def assess_knowledge(

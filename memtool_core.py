@@ -893,7 +893,7 @@ class MemoryStore(_LazySemanticBase):
                 conn.close()
 
     def _track_access_batch(self, item_ids: List[str]) -> bool:
-        """批量更新访问记录（不影响主流程）"""
+        """批量更新访问记录 + 巩固分数（不影响主流程）"""
         if not item_ids:
             return True
 
@@ -910,6 +910,21 @@ class MemoryStore(_LazySemanticBase):
                 """,
                 [now] + item_ids,
             )
+            # Bug#4 fix: 同步更新 consolidation_score（与 _track_access 口径一致）
+            rows = conn.execute(
+                f"SELECT id, access_count, created_at, updated_at FROM memory_items WHERE id IN ({placeholders})",
+                item_ids,
+            ).fetchall()
+            for row in rows:
+                consolidation = self._compute_consolidation(
+                    access_count=row["access_count"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+                conn.execute(
+                    "UPDATE memory_items SET consolidation_score = ? WHERE id = ?",
+                    (consolidation, row["id"]),
+                )
             conn.commit()
             return True
         except sqlite3.Error as e:
@@ -1253,6 +1268,7 @@ class MemoryStore(_LazySemanticBase):
             # Use SQL LIMIT and OFFSET for better performance
             fetch_limit = int(limit)
             fetch_offset = int(offset)
+            original_offset = fetch_offset  # Bug#3 fix: 保留原始 offset 用于复杂排序切片
             if sort_by in {"confidence", "recency", "mixed"}:
                 # For complex sorting, fetch more rows and sort in memory
                 fetch_limit = min(max(fetch_limit * 5, 200), 1000)
@@ -1283,9 +1299,9 @@ class MemoryStore(_LazySemanticBase):
             elif sort_by == "mixed":
                 items.sort(key=lambda x: (x.get("mixed_score", 0.0), x.get("updated_at") or ""), reverse=True)
 
-            # For complex sorting, apply offset after sorting
+            # Bug#3 fix: 复杂排序时用原始 offset 做切片
             if sort_by in {"confidence", "recency", "mixed"}:
-                items = items[fetch_offset:fetch_offset + int(limit)]
+                items = items[original_offset:original_offset + int(limit)]
             else:
                 items = items[:int(limit)]
 
@@ -1307,6 +1323,7 @@ class MemoryStore(_LazySemanticBase):
         sort_by: str = "updated",
         include_stale: bool = True,
         stale_threshold: float = DEFAULT_STALE_THRESHOLD,
+        track_access: bool = True,  # Bug#2 fix: 允许内部调用跳过访问追踪
         # 废弃参数（保留兼容性，但忽略）
         task_id: Optional[str] = None,
         step_id: Optional[str] = None,
@@ -1397,8 +1414,9 @@ class MemoryStore(_LazySemanticBase):
                 items.sort(key=lambda x: (x.get("mixed_score", 0.0), x.get("updated_at") or ""), reverse=True)
 
             # Phase 2-1: 追踪访问（对搜索结果）
-            access_ids = [item["id"] for item in items[: int(limit)]]
-            self._track_access_batch(access_ids)
+            if track_access:
+                access_ids = [item["id"] for item in items[: int(limit)]]
+                self._track_access_batch(access_ids)
 
             # 瘦身后：过滤只返回核心字段
             filtered_items = [_filter_core_fields(item) for item in items[: int(limit)]]
@@ -1548,6 +1566,12 @@ class MemoryStore(_LazySemanticBase):
             conn = self._get_conn()
             cur = conn.execute("DELETE FROM memory_items WHERE id = ?", (item_id,))
             conn.commit()
+            # Bug#1 fix: 同步清理向量索引
+            if cur.rowcount:
+                try:
+                    self.vector_delete(item_id)
+                except Exception:
+                    pass  # 向量清理失败不阻塞主流程
             return {"ok": True, "deleted": cur.rowcount}
 
         except sqlite3.Error as e:
@@ -1660,6 +1684,12 @@ class MemoryStore(_LazySemanticBase):
                 conn.executemany("DELETE FROM memory_items WHERE id = ?", ids)
                 conn.commit()
                 deleted = len(ids)
+                # Bug#1 fix: 清理向量索引
+                for c in candidates:
+                    try:
+                        self.vector_delete(c["id"])
+                    except Exception:
+                        pass
 
             return {
                 "ok": True,

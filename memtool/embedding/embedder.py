@@ -207,7 +207,8 @@ class OllamaEmbedder(Embedder):
         for text in texts:
             response = requests.post(
                 f"{self._base_url}/api/embeddings",
-                json={"model": self._model, "prompt": text}
+                json={"model": self._model, "prompt": text},
+                timeout=(5, 60),  # connect 5s, read 60s
             )
             response.raise_for_status()
             data = response.json()

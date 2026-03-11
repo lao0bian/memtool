@@ -385,11 +385,13 @@ class SemanticSearchMixin:
             Dict with ok, items, and metadata
         """
         # First, get FTS results (always fast, ~ms)
+        # Bug#2 fix: track_access=False 避免候选集被双重计数
         fts_result = self.search(
             query=query,
             type=type,
             task_id=task_id,
-            limit=limit * 2
+            limit=limit * 2,
+            track_access=False,
         )
         
         fts_items = fts_result.get("items", []) if fts_result.get("ok") else []
