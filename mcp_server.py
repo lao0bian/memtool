@@ -12,9 +12,12 @@ import sys
 import threading
 from typing import Any, Dict, List, Optional
 
-from memtool.observability import compute_stats, health_check
-from memtool.history import get_history
 from memtool_core import DEFAULT_DB, MemtoolError, MemoryStore, init_db
+
+# Lazy imports for modules only used by specific tools:
+# - memtool.observability (compute_stats, health_check) → memory_stats, memory_health_check
+# - memtool.history (get_history) → memory_history
+# These are imported at point-of-use to speed up cold start.
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -876,6 +879,7 @@ if FastMCP is not None:
     ) -> Dict[str, Any]:
         """Get basic memory statistics."""
         try:
+            from memtool.observability import compute_stats
             store = _store_for(db_path)
             stats = compute_stats(store)
             return {"ok": True, **stats}
@@ -893,6 +897,7 @@ if FastMCP is not None:
         if thresholds is not None and not isinstance(thresholds, dict):
             return _param_error("thresholds must be a dict")
         try:
+            from memtool.observability import health_check
             store = _store_for(db_path)
             return health_check(store, thresholds=thresholds)
         except MemtoolError as e:
@@ -948,6 +953,7 @@ if FastMCP is not None:
             return _param_error("item_id cannot be empty")
         
         try:
+            from memtool.history import get_history
             store = _store_for(db_path)
             return get_history(store, str(item_id).strip(), limit=limit)
         except MemtoolError as e:
@@ -1000,6 +1006,46 @@ else:
     mcp = None
 
 
+def _preheat_vector_deps() -> None:
+    """Background thread: preload heavy vector dependencies after MCP starts.
+
+    This ensures:
+    - FTS searches work immediately (no delay)
+    - Vector/semantic searches become available ~20s later without blocking
+    - Jieba dictionary is preloaded for faster first tokenization
+    """
+    try:
+        # 1. Preload jieba dictionary (~841ms)
+        try:
+            import jieba
+            jieba.initialize()
+            LOG.info("Preheat: jieba dictionary loaded")
+        except ImportError:
+            pass
+
+        # 2. Preload vector dependencies (chromadb ~2.6s, sentence-transformers ~15.8s)
+        db_path = _resolve_db_path(None)
+        store = _store_for(db_path)
+        if hasattr(store, '_init_vector_store'):
+            ready = store._init_vector_store()
+            LOG.info("Preheat: vector store initialized = %s", ready)
+
+            if ready and getattr(store, '_vector_store', None) is not None:
+                embedder = getattr(store._vector_store, '_embedder', None)
+                if embedder is not None and hasattr(embedder, '_load_model'):
+                    embedder._load_model()
+                    LOG.info("Preheat: embedding model loaded")
+                elif embedder is not None:
+                    LOG.info("Preheat: embedder has no explicit model preload hook, skipping")
+
+        if hasattr(store, 'vector_status'):
+            status = store.vector_status()
+            LOG.info("Preheat: vector store status = %s", status.get("enabled", False))
+
+    except Exception as e:
+        LOG.warning("Preheat failed (non-fatal): %s", e)
+
+
 def main() -> None:
     if mcp is None:
         msg = "mcp package not available. Install with: pip install 'mcp[cli]'"
@@ -1008,6 +1054,12 @@ def main() -> None:
         raise SystemExit(msg)
 
     _setup_logging()
+
+    # Start background preheating (non-blocking)
+    preheat_thread = threading.Thread(target=_preheat_vector_deps, daemon=True, name="preheat")
+    preheat_thread.start()
+    LOG.info("Background preheat started")
+
     mcp.run()
 
 

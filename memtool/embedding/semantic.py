@@ -57,6 +57,7 @@ class SemanticSearchMixin:
         self._vector_store: Optional["VectorStore"] = None
         self._vector_lock = threading.Lock()
         self._vector_initialized = False
+        self._vector_warmup_started = False
     
     def _get_vector_dir(self) -> Path:
         """Get vector storage directory"""
@@ -67,7 +68,7 @@ class SemanticSearchMixin:
         return Path(db_path).parent / "vectors"
     
     def _init_vector_store(self) -> bool:
-        """Initialize vector store if enabled
+        """Initialize vector store if enabled (blocking).
         
         Returns:
             True if vector store is available, False otherwise
@@ -116,6 +117,31 @@ class SemanticSearchMixin:
                     raise
                 logger.warning(f"Vector search disabled due to error: {e}")
                 return False
+
+    def _is_vector_ready(self) -> bool:
+        """Non-blocking check: is vector store initialized and ready?
+        
+        Unlike _init_vector_store(), this returns immediately without
+        triggering model loading. Used for async degradation.
+        """
+        return self._vector_initialized and self._vector_store is not None
+
+    def _ensure_vector_warmup(self) -> None:
+        """Kick off background vector store initialization if not already started.
+        
+        This is fire-and-forget: starts a daemon thread to load the embedding
+        model so subsequent calls can use vector search.
+        """
+        if self._vector_initialized or self._vector_warmup_started:
+            return
+        self._vector_warmup_started = True
+        thread = threading.Thread(
+            target=self._init_vector_store,
+            daemon=True,
+            name="vector-warmup",
+        )
+        thread.start()
+        logger.info("Background vector warmup started")
     
     def vector_index(self, item: Dict[str, Any]) -> bool:
         """Index a single item for vector search
@@ -210,6 +236,57 @@ class SemanticSearchMixin:
             logger.warning(f"Failed to delete from vector index: {e}")
             return False
     
+    def _enrich_vector_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not results:
+            return []
+            
+        # Only fetch items that lack full metadata (e.g. missing 'type')
+        missing_ids = [item["id"] for item in results if "type" not in item]
+        if not missing_ids:
+            return results
+            
+        try:
+            conn = getattr(self, "_get_conn", lambda: None)()
+            if not conn:
+                return results
+
+            placeholders = ",".join("?" * len(missing_ids))
+            sql = f"SELECT * FROM memory_items WHERE id IN ({placeholders})"
+            rows = conn.execute(sql, missing_ids).fetchall()
+            
+            import datetime as _dt
+            from memtool_core import _row_to_obj
+            from memtool_lifecycle import lifecycle_meta
+            from memtool_rank import score_item
+            
+            full_items = {}
+            now = _dt.datetime.now(tz=_dt.timezone.utc)
+            for r in rows:
+                obj = _row_to_obj(r)
+                obj.update(lifecycle_meta(obj, now=now))
+                obj.update(score_item(obj, now=now))
+                full_items[obj["id"]] = obj
+                
+            if hasattr(self, '_track_access_batch'):
+                self._track_access_batch(list(full_items.keys()))
+                
+            enriched = []
+            for item in results:
+                if item["id"] in full_items and "type" not in item:
+                    full_obj = full_items[item["id"]]
+                    # Retain score fields
+                    for k in ["hybrid_score", "fts_score", "vector_score", "score"]:
+                        if k in item:
+                            full_obj[k] = item[k]
+                    enriched.append(full_obj)
+                else:
+                    enriched.append(item)
+                    
+            return enriched
+        except Exception as e:
+            logger.warning(f"Failed to enrich vector results from db: {e}")
+            return results
+
     def semantic_search(
         self,
         query: str,
@@ -219,6 +296,9 @@ class SemanticSearchMixin:
         min_score: float = 0.3,
     ) -> Dict[str, Any]:
         """Semantic vector search
+        
+        Async degradation: if the embedding model is still loading,
+        returns a WARMUP_IN_PROGRESS response instead of blocking.
         
         Args:
             query: Natural language query
@@ -230,11 +310,13 @@ class SemanticSearchMixin:
         Returns:
             Dict with ok, items, and metadata
         """
-        if not self._init_vector_store():
+        # --- Async degradation: don't block if model not loaded yet ---
+        if not self._is_vector_ready():
+            self._ensure_vector_warmup()
             return {
                 "ok": False,
-                "error": "VECTOR_UNAVAILABLE",
-                "message": "Vector search not available",
+                "error": "WARMUP_IN_PROGRESS",
+                "message": "向量搜索模型正在加载中，请使用 memory_search 或稍后重试",
                 "items": []
             }
         
@@ -253,6 +335,10 @@ class SemanticSearchMixin:
                 min_score=min_score
             )
             
+            # Fetch full db objects for items that purely came from vector DB 
+            # to prevent returning incomplete items missing 'key', 'tags', etc.
+            results = self._enrich_vector_results(results)
+
             # 瘦身后：过滤只返回核心字段
             filtered_results = [_filter_core_fields(item) for item in results]
             return {
@@ -283,6 +369,10 @@ class SemanticSearchMixin:
     ) -> Dict[str, Any]:
         """Hybrid search combining FTS and vector search
         
+        Async degradation: if the embedding model is still loading,
+        returns FTS-only results immediately with mode="fts_degraded".
+        Subsequent calls after warmup completes will use full hybrid mode.
+        
         Args:
             query: Search query
             type: Optional type filter
@@ -294,7 +384,7 @@ class SemanticSearchMixin:
         Returns:
             Dict with ok, items, and metadata
         """
-        # First, get FTS results
+        # First, get FTS results (always fast, ~ms)
         fts_result = self.search(
             query=query,
             type=type,
@@ -304,8 +394,13 @@ class SemanticSearchMixin:
         
         fts_items = fts_result.get("items", []) if fts_result.get("ok") else []
         
-        # If vector search not available, return FTS only
-        if not self._init_vector_store():
+        # --- Async degradation: if vector not ready, return FTS immediately ---
+        if not self._is_vector_ready():
+            self._ensure_vector_warmup()
+            # Return FTS results with degraded mode indicator
+            if fts_result.get("ok"):
+                fts_result["mode"] = "fts_degraded"
+                fts_result["vector_status"] = "warming_up"
             return fts_result
         
         try:
@@ -331,6 +426,9 @@ class SemanticSearchMixin:
                 where=where if where else None
             )
             
+            # 补全仅由 vector_store 返回而 fts_results 未覆盖的数据对象
+            results = self._enrich_vector_results(results)
+
             # 瘦身后：过滤只返回核心字段
             filtered_results = [_filter_core_fields(item) for item in results]
             return {

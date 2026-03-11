@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-import numpy as np
+import numpy as np  # noqa: F401 (lazy - actually loaded on first embedder use)
 
 logger = logging.getLogger(__name__)
 
@@ -69,30 +70,35 @@ class LocalEmbedder(Embedder):
         self._model = None
         self._model_name = model_name or DEFAULT_LOCAL_MODEL
         self._dimension: Optional[int] = None
+        self._load_lock = threading.Lock()
         
     def _load_model(self):
         if self._model is not None:
             return
-            
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError:
-            raise ImportError(
-                "sentence-transformers is required for local embeddings. "
-                "Install with: pip install sentence-transformers"
-            )
-        
-        try:
-            logger.info(f"Loading embedding model: {self._model_name}")
-            self._model = SentenceTransformer(self._model_name)
-            self._dimension = self._model.get_sentence_embedding_dimension()
-            logger.info(f"Loaded model with dimension: {self._dimension}")
-        except Exception as e:
-            logger.warning(f"Failed to load {self._model_name}: {e}, trying fallback")
-            self._model_name = FALLBACK_LOCAL_MODEL
-            self._model = SentenceTransformer(self._model_name)
-            self._dimension = self._model.get_sentence_embedding_dimension()
-            logger.info(f"Loaded fallback model with dimension: {self._dimension}")
+
+        with self._load_lock:
+            if self._model is not None:
+                return
+
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError:
+                raise ImportError(
+                    "sentence-transformers is required for local embeddings. "
+                    "Install with: pip install sentence-transformers"
+                )
+
+            try:
+                logger.info(f"Loading embedding model: {self._model_name}")
+                self._model = SentenceTransformer(self._model_name)
+                self._dimension = self._model.get_sentence_embedding_dimension()
+                logger.info(f"Loaded model with dimension: {self._dimension}")
+            except Exception as e:
+                logger.warning(f"Failed to load {self._model_name}: {e}, trying fallback")
+                self._model_name = FALLBACK_LOCAL_MODEL
+                self._model = SentenceTransformer(self._model_name)
+                self._dimension = self._model.get_sentence_embedding_dimension()
+                logger.info(f"Loaded fallback model with dimension: {self._dimension}")
     
     def embed(self, texts: List[str]) -> np.ndarray:
         self._load_model()

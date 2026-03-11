@@ -20,13 +20,96 @@ from memtool_recommend import recommend_items
 from memtool.storage.connection import SQLiteConnectionPool
 from memtool.utils import _extract_keywords
 
-# Try to import semantic search mixin
-try:
-    from memtool.embedding.semantic import SemanticSearchMixin
-    _HAS_VECTOR = True
-except ImportError:
-    SemanticSearchMixin = object  # type: ignore
-    _HAS_VECTOR = False
+# Lazy import for SemanticSearchMixin to avoid loading heavy dependencies
+# (chromadb ~2.6s, sentence-transformers ~15.8s, numpy ~200ms) at module load.
+_SemanticSearchMixin = None  # lazy cache
+_HAS_VECTOR: Optional[bool] = None  # None = not checked yet
+
+
+def _get_semantic_mixin():
+    """Lazily import SemanticSearchMixin only when needed."""
+    global _SemanticSearchMixin, _HAS_VECTOR
+    if _HAS_VECTOR is not None:
+        return _SemanticSearchMixin
+    try:
+        from memtool.embedding.semantic import SemanticSearchMixin as _Mixin
+        _SemanticSearchMixin = _Mixin
+        _HAS_VECTOR = True
+    except ImportError:
+        _SemanticSearchMixin = None
+        _HAS_VECTOR = False
+    return _SemanticSearchMixin
+
+
+class _LazySemanticBase:
+    """Proxy base class: delegates vector methods to SemanticSearchMixin on first use."""
+
+    def _init_vector_attrs(self) -> None:
+        mixin = _get_semantic_mixin()
+        if mixin is not None:
+            # Dynamically bind all mixin methods to this instance
+            import types
+            for name in dir(mixin):
+                if name.startswith('_') and name != '_init_vector_attrs':
+                    if name.startswith('__'):
+                        continue
+                attr = getattr(mixin, name)
+                if callable(attr):
+                    setattr(self, name, types.MethodType(attr, self))
+            # Call the real _init_vector_attrs
+            mixin._init_vector_attrs(self)
+        else:
+            # No vector support, these will raise helpful errors
+            pass
+
+    def semantic_search(self, **kwargs):
+        mixin = _get_semantic_mixin()
+        if mixin is None:
+            return {
+                "ok": False,
+                "error": "VECTOR_UNAVAILABLE",
+                "message": "Vector dependencies not installed (pip install memtool[vector])",
+                "items": []
+            }
+        # Bind and call
+        return mixin.semantic_search(self, **kwargs)
+
+    def hybrid_search(self, **kwargs):
+        mixin = _get_semantic_mixin()
+        if mixin is None:
+            # Fallback to FTS search
+            return self.search(**kwargs)
+        return mixin.hybrid_search(self, **kwargs)
+
+    def vector_sync(self, **kwargs):
+        mixin = _get_semantic_mixin()
+        if mixin is None:
+            return {"ok": False, "error": "VECTOR_UNAVAILABLE", "message": "Vector not available"}
+        return mixin.vector_sync(self, **kwargs)
+
+    def vector_status(self):
+        mixin = _get_semantic_mixin()
+        if mixin is None:
+            return {"enabled": False, "reason": "vector dependencies not installed"}
+        return mixin.vector_status(self)
+
+    def vector_index(self, item):
+        mixin = _get_semantic_mixin()
+        if mixin is None:
+            return False
+        return mixin.vector_index(self, item)
+
+    def vector_index_batch(self, items):
+        mixin = _get_semantic_mixin()
+        if mixin is None:
+            return 0
+        return mixin.vector_index_batch(self, items)
+
+    def vector_delete(self, item_id):
+        mixin = _get_semantic_mixin()
+        if mixin is None:
+            return False
+        return mixin.vector_delete(self, item_id)
 
 DEFAULT_DB = os.environ.get("MEMTOOL_DB", "./memtool.db")
 _SCHEMA_LOCK = threading.Lock()
@@ -346,6 +429,51 @@ def _build_content_search(content: str) -> str:
     return f"{content}\n{' '.join(tokens)}"
 
 
+def _build_fts_query(query: str) -> str:
+    """构建 FTS5 查询，对中文进行 jieba 分词以提高匹配率
+    
+    FTS5 的 unicode61 tokenizer 会将中文逐字拆分，
+    而 content_search 中存储了 jieba 分词的结果。
+    为了匹配分词后的 token，需要对查询也做同样的分词处理，
+    并构建 OR 查询来提高召回率。
+    
+    例如：
+        输入: "MCP 记忆系统测试"
+        输出: "MCP" OR "记忆" OR "系统" OR "测试" OR "记忆系统"
+    """
+    if not query:
+        return query
+    
+    tokens = _tokenize_for_search(query)
+    if not tokens:
+        # 没有 jieba 或无法分词，返回原始查询
+        return query
+    
+    # 收集所有术语：原始空格分隔的词 + jieba 分词结果
+    all_terms = set()
+    
+    # 原始空格分隔的非空术语
+    for part in query.split():
+        part = part.strip()
+        if len(part) >= _MIN_TOKEN_LEN:
+            all_terms.add(part)
+    
+    # jieba 分词结果
+    all_terms.update(tokens)
+    
+    if not all_terms:
+        return query
+    
+    # 构建 FTS5 OR 查询，每个术语用双引号包裹避免语法问题
+    escaped = []
+    for term in all_terms:
+        # 转义双引号
+        safe = term.replace('"', '""')
+        escaped.append(f'"{safe}"')
+    
+    return " OR ".join(escaped)
+
+
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(r["name"] == column for r in rows)
@@ -643,7 +771,7 @@ def _raise_db_error(e: sqlite3.Error) -> None:
     raise MemtoolError(_db_error_payload(e), 4)
 
 
-class MemoryStore(SemanticSearchMixin):
+class MemoryStore(_LazySemanticBase):
     """Memory storage with SQLite backend and optional vector search
     
     Vector search is enabled when:
@@ -855,7 +983,7 @@ class MemoryStore(SemanticSearchMixin):
     def put(
         self,
         *,
-        item_id: Optional[str],
+        item_id: Optional[str] = None,
         type: str,
         key: str,
         content: str,
@@ -900,6 +1028,14 @@ class MemoryStore(SemanticSearchMixin):
             step_id_value = DEPRECATED_DEFAULTS['step_id']
             source_value = DEPRECATED_DEFAULTS['source']
             session_id_value = DEPRECATED_DEFAULTS['session_id']
+
+            try:
+                from memtool.context import ContextExtractor
+
+                context_tags, emotional_valence, urgency_level = ContextExtractor.extract(content=content)
+                context_tags_json = json.dumps(context_tags, ensure_ascii=False)
+            except Exception as e:
+                logger.debug("Context extraction skipped for put: %s", e)
 
             if item_id:
                 cur = conn.execute("SELECT * FROM memory_items WHERE id = ?", (item_id,))
@@ -982,34 +1118,27 @@ class MemoryStore(SemanticSearchMixin):
             conn.commit()
             result = {"ok": True, "action": action, "id": final_id, "version": version}
 
-            # Auto-index to vector store if available
+            # Auto-index to vector store if available (Async execution, avoids blocking Store IO ~100-500ms)
             if _HAS_VECTOR:
-                try:
-                    self.vector_index({
-                        "id": final_id,
-                        "content": content,
-                        "type": type,
-                        "key": key,
-                        "tags": tags or [],
-                        "confidence_level": confidence_level,
-                        "updated_at": now,
-                    })
-                except Exception:
-                    pass  # Don't fail put if vector indexing fails
+                def _async_vector_index():
+                    try:
+                        self.vector_index({
+                            "id": final_id,
+                            "content": content,
+                            "type": type,
+                            "key": key,
+                            "tags": tags or [],
+                            "confidence_level": confidence_level,
+                            "updated_at": now,
+                        })
+                    except Exception as e:
+                        logger.warning(f"Async vector index failed for {final_id}: {e}")
+                
+                import threading
+                threading.Thread(target=_async_vector_index, daemon=True).start()
 
-            # 相似度检查：在 insert 或 update 后，检查是否有类似的记录
-            similar_items = self.find_similar_items(content, type=type, threshold=0.8, limit=3)
-            if similar_items:
-                result["warning"] = "duplicate_detection"
-                result["similar_items"] = [
-                    {
-                        "id": item["id"],
-                        "key": item["key"],
-                        "similarity": item["similarity"],
-                        "updated_at": item["updated_at"],
-                    }
-                    for item in similar_items
-                ]
+            # 移除同步的 find_similar_items 检查（避免全表扫描提取关键词严重拖慢 store 性能 ~1000ms+）
+            # 重复检测统一由 memory_suggest_merge 负责
 
             return result
 
@@ -1216,7 +1345,7 @@ class MemoryStore(SemanticSearchMixin):
                 where.append("m.key = ?")
                 params.append(key)
 
-            rows: List[sqlite3.Row]
+            rows: List[sqlite3.Row] = []
             if fts_ok:
                 try:
                     sql = """
@@ -1225,7 +1354,7 @@ class MemoryStore(SemanticSearchMixin):
                     JOIN memory_items m ON m.id = f.id
                     WHERE f.content_search MATCH ?
                     """
-                    f_params: List[Any] = [q]
+                    f_params: List[Any] = [_build_fts_query(q)]
                     if where:
                         sql += " AND " + " AND ".join(where)
                         f_params += params
@@ -1238,7 +1367,7 @@ class MemoryStore(SemanticSearchMixin):
                 except sqlite3.Error:
                     fts_ok = False
 
-            if not fts_ok:
+            if not fts_ok or not rows:
                 sql = "SELECT m.* FROM memory_items m WHERE COALESCE(NULLIF(m.content_search, ''), m.content) LIKE ?"
                 like_params: List[Any] = [f"%{q}%"]
                 if where:
@@ -1300,14 +1429,14 @@ class MemoryStore(SemanticSearchMixin):
         except (TypeError, ValueError):
             fetch_limit = 30
 
-        try:
-            base_results = self.hybrid_search(
-                query=query,
-                type=type,
-                task_id=task_id,
-                limit=fetch_limit,
-            )
-        except Exception:
+        has_filters = (
+            bool(context_tags)
+            or emotional_filter is not None
+            or urgency_min is not None
+            or urgency_level is not None
+        )
+
+        if has_filters:
             base_results = self.search(
                 query=query,
                 type=type,
@@ -1316,8 +1445,56 @@ class MemoryStore(SemanticSearchMixin):
                 include_stale=include_stale,
                 stale_threshold=stale_threshold,
             )
+        else:
+            try:
+                base_results = self.hybrid_search(
+                    query=query,
+                    type=type,
+                    task_id=task_id,
+                    limit=fetch_limit,
+                )
+            except Exception:
+                base_results = self.search(
+                    query=query,
+                    type=type,
+                    task_id=task_id,
+                    limit=fetch_limit,
+                    include_stale=include_stale,
+                    stale_threshold=stale_threshold,
+                )
 
         items = base_results.get("items", [])
+        needs_context_fields = any(
+            "context_tags" not in item
+            or "emotional_valence" not in item
+            or "urgency_level" not in item
+            or "is_stale" not in item
+            for item in items
+        )
+        if needs_context_fields and items:
+            item_ids = [item.get("id") for item in items if item.get("id")]
+            if item_ids:
+                placeholders = ",".join("?" * len(item_ids))
+                try:
+                    conn = self._get_conn()
+                    rows = conn.execute(
+                        f"SELECT * FROM memory_items WHERE id IN ({placeholders})",
+                        tuple(item_ids),
+                    ).fetchall()
+                    now = _dt.datetime.now(tz=_dt.timezone.utc)
+                    hydrated = {}
+                    for row in rows:
+                        full_item = _row_to_obj(row, include_deprecated=True)
+                        full_item.update(lifecycle_meta(full_item, now=now, stale_threshold=stale_threshold))
+                        full_item.update(score_item(full_item, now=now))
+                        hydrated[full_item["id"]] = full_item
+                    items = [
+                        {**hydrated[item["id"]], **item} if item.get("id") in hydrated else item
+                        for item in items
+                    ]
+                except sqlite3.Error as e:
+                    logger.warning("Failed to hydrate contextual search items: %s", e)
+
         if not include_stale:
             items = [i for i in items if not i.get("is_stale")]
 
